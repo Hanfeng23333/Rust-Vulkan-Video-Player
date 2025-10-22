@@ -1,7 +1,6 @@
 //Made by Han_feng
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use smallvec::smallvec;
 use vulkano::command_buffer::allocator::{CommandBufferAllocator, StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo};
 use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
@@ -103,7 +102,7 @@ impl Vulkan_application{
         }).collect();
         
         //Swap chain
-        let (swap_chain, images) = get_swap_chain_and_images(physical_device.clone(), &queue_family, device.clone(), surface.clone(), window.clone());
+        let (swap_chain, images) = get_swap_chain_and_images(physical_device.clone(), queue_family.clone(), device.clone(), surface.clone(), window.clone());
         self.swap_chain = Some(swap_chain.clone());
         self.swap_chain_images = Some(images);
     }
@@ -186,10 +185,10 @@ impl Queue_family_indices {
 
 impl IntoIterator for Queue_family_indices {
     type Item = u32;
-    type IntoIter = smallvec::IntoIter<Self::Item, 4>;
+    type IntoIter = std::vec::IntoIter<Self::Item>;
 
     fn into_iter(self) -> Self::IntoIter {
-        let mut result = smallvec![];
+        let mut result = vec![];
         result.extend(self.graphics_family);
         result.extend(self.present_family);
         result.into_iter()
@@ -306,7 +305,7 @@ where T: FromIterator<Arc<Queue>>
     (device, queues.collect())
 }
 
-fn get_swap_chain_and_images(physical_device: Arc<PhysicalDevice>, indices: &Queue_family_indices, device: Arc<Device>, surface: Arc<Surface>, window: Arc<Window>) -> (Arc<Swapchain>, Vec<Arc<Image>>) {
+fn get_swap_chain_and_images(physical_device: Arc<PhysicalDevice>, indices: Queue_family_indices, device: Arc<Device>, surface: Arc<Surface>, window: Arc<Window>) -> (Arc<Swapchain>, Vec<Arc<Image>>) {
     //Choose a surface format
     let surface_formats = physical_device.surface_formats(&surface, Default::default()).unwrap();
     let (image_format, image_color_space) = if surface_formats.contains(&(Format::B8G8R8A8_SRGB, ColorSpace::SrgbNonLinear)){
@@ -343,7 +342,7 @@ fn get_swap_chain_and_images(physical_device: Arc<PhysicalDevice>, indices: &Que
             image_usage: ImageUsage::COLOR_ATTACHMENT,
             min_image_count: (surface_capabilities.min_image_count+5).min(surface_capabilities.max_image_count.unwrap_or(surface_capabilities.min_image_count+5)),
             image_sharing: if indices.graphics_family != indices.present_family {
-                Sharing::Concurrent(indices.clone().into_iter().collect())
+                Sharing::Concurrent(indices.into_iter().collect())
             }
             else{
                 Sharing::Exclusive

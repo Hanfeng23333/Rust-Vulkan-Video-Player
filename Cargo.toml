@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 vulkano = "0.35.2"
 winit = "0.30.12"
-smallvec = "2.0.0-alpha.11"
 
 [profile.dev]
 opt-level = 1
