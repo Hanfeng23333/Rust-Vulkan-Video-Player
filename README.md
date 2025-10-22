@@ -4,6 +4,6 @@ A simple video player based on Vulkan implemented by Rust
 
 ## Abilities
 - Using Vulkan for video playback
-- achieve synchronization between video and audio streams
+- Achieving synchronization between video and audio streams
 
 **Under Construction...**

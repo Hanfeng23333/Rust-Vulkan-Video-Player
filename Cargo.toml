@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 vulkano = "0.35.1"
 winit = "0.30.12"
+
+[profile.dev]
+opt-level = 1
