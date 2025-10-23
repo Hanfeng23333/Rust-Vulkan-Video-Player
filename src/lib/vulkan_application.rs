@@ -1,17 +1,30 @@
 //Made by Han_feng
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::Read;
 use std::sync::Arc;
-use vulkano::command_buffer::allocator::{CommandBufferAllocator, StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo};
-use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
-use vulkano::{Version, VulkanLibrary};
+use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags};
 use vulkano::format::Format;
-use vulkano::image::{Image, ImageUsage};
-use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions};
+use vulkano::image::sampler::ComponentMapping;
+use vulkano::image::view::{ImageView, ImageViewCreateInfo};
+use vulkano::image::{Image, ImageAspects, ImageLayout, ImageSubresourceRange, ImageUsage, SampleCount};
 use vulkano::instance::debug::{DebugUtilsMessageSeverity, DebugUtilsMessageType, DebugUtilsMessenger, DebugUtilsMessengerCallback, DebugUtilsMessengerCallbackData, DebugUtilsMessengerCreateInfo};
-use vulkano::memory::allocator::{MemoryAllocator, StandardMemoryAllocator};
-use vulkano::swapchain::{ColorSpace, PresentMode, Surface, SurfaceCapabilities, Swapchain, SwapchainCreateFlags, SwapchainCreateInfo};
+use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions};
+use vulkano::pipeline::graphics::color_blend::{AttachmentBlend, BlendFactor, ColorBlendAttachmentState, ColorBlendState};
+use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
+use vulkano::pipeline::graphics::rasterization::{CullMode, FrontFace, RasterizationState};
+use vulkano::pipeline::graphics::viewport::ViewportState;
+use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
+use vulkano::pipeline::layout::PipelineLayoutCreateInfo;
+use vulkano::pipeline::{DynamicState, GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo};
+use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, RenderPass, RenderPassCreateInfo, Subpass, SubpassDescription};
+use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo};
+use vulkano::swapchain::{ColorSpace, PresentMode, Surface, Swapchain, SwapchainCreateInfo};
 use vulkano::sync::Sharing;
+use vulkano::{shader, Version, VulkanLibrary};
+use vulkano::pipeline::graphics::multisample::MultisampleState;
+use vulkano::pipeline::graphics::vertex_input::VertexInputState;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
@@ -28,13 +41,15 @@ pub struct Vulkan_application{
     
     //Vulkan attributes
     instance: Option<Arc<Instance>>,
-    debug_messenger: Option<DebugUtilsMessenger>,
+    _debug_messenger: Option<DebugUtilsMessenger>,
     physical_device: Option<Arc<PhysicalDevice>>,
     device: Option<Arc<Device>>,
     queues: HashMap<String, Option<Arc<Queue>>>,
     surface: Option<Arc<Surface>>,
     swap_chain: Option<Arc<Swapchain>>,
-    swap_chain_images: Option<Vec<Arc<Image>>>
+    swap_chain_images: Vec<Arc<Image>>,
+    swap_chain_image_views: Vec<Arc<ImageView>>,
+    graphics_pipeline: Option<Arc<GraphicsPipeline>>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -79,7 +94,7 @@ impl Vulkan_application{
         //Debug messenger
         #[cfg(debug_assertions)]
         {
-            self.debug_messenger = Some(DebugUtilsMessenger::new(instance.clone(), DebugUtilsMessengerCreateInfo{
+            self._debug_messenger = Some(DebugUtilsMessenger::new(instance.clone(), DebugUtilsMessengerCreateInfo{
                 message_severity: DebugUtilsMessageSeverity::ERROR | DebugUtilsMessageSeverity::WARNING | DebugUtilsMessageSeverity::VERBOSE,
                 message_type: DebugUtilsMessageType::GENERAL | DebugUtilsMessageType::PERFORMANCE | DebugUtilsMessageType::VALIDATION,
                 ..DebugUtilsMessengerCreateInfo::user_callback(unsafe { DebugUtilsMessengerCallback::new(debug_callback) })
@@ -104,7 +119,23 @@ impl Vulkan_application{
         //Swap chain
         let (swap_chain, images) = get_swap_chain_and_images(physical_device.clone(), queue_family.clone(), device.clone(), surface.clone(), window.clone());
         self.swap_chain = Some(swap_chain.clone());
-        self.swap_chain_images = Some(images);
+        self.swap_chain_images = images;
+        self.swap_chain_image_views = self.swap_chain_images.iter().map(|image| {
+            ImageView::new(image.clone(), ImageViewCreateInfo{
+                format: swap_chain.image_format(),
+                component_mapping: ComponentMapping::identity(),
+                subresource_range: ImageSubresourceRange{
+                    aspects: ImageAspects::COLOR,
+                    mip_levels: 0..1,
+                    array_layers: 0..1
+                },
+                ..Default::default()
+            }).expect("Failed to create swap chain image view")
+        }).collect();
+
+        //Graphics pipeline
+        let graphics_pipeline = get_graphics_pipeline(device.clone(), swap_chain.clone());
+        self.graphics_pipeline = Some(graphics_pipeline.clone());
     }
     
     pub fn run(&mut self){
@@ -348,8 +379,77 @@ fn get_swap_chain_and_images(physical_device: Arc<PhysicalDevice>, indices: Queu
                 Sharing::Exclusive
             },
             pre_transform: surface_capabilities.current_transform,
-            clipped: true,
             ..Default::default()
         }
     ).expect("Couldn't create a swap chain")
+}
+
+fn get_shader(file_path: String, device: Arc<Device>) -> Arc<ShaderModule>{
+    let mut shader_file = File::open(file_path).unwrap();
+    let mut shader_data = vec![];
+    shader_file.read_to_end(&mut shader_data).unwrap();
+    
+    unsafe {
+        ShaderModule::new(device, ShaderModuleCreateInfo::new(&shader::spirv::bytes_to_words(&shader_data).expect("Couldn't read spirv shader data")))
+            .expect("Failed to create shader module")
+    }
+}
+fn get_graphics_pipeline(device: Arc<Device>, swap_chain: Arc<Swapchain>) -> Arc<GraphicsPipeline> {
+    //Shaders
+    let vertex_shader = get_shader("shaders/vert.spv".to_string(), device.clone());
+    let fragment_shader = get_shader("shaders/frag.spv".to_string(), device.clone());
+
+    GraphicsPipeline::new(
+        device.clone(), None, GraphicsPipelineCreateInfo{
+            stages: [
+                PipelineShaderStageCreateInfo::new(vertex_shader.entry_point("main").unwrap()),
+                PipelineShaderStageCreateInfo::new(fragment_shader.entry_point("main").unwrap()),
+            ].into_iter().collect(),
+            dynamic_state: [DynamicState::Viewport, DynamicState::Scissor].into_iter().collect(),
+            vertex_input_state: Some(VertexInputState::default()),
+            input_assembly_state: Some(InputAssemblyState::default()),
+            viewport_state: Some(ViewportState::default()),
+            rasterization_state: Some(RasterizationState{
+                cull_mode: CullMode::Back,
+                front_face: FrontFace::Clockwise,
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            color_blend_state: Some(ColorBlendState{
+                attachments: vec![ColorBlendAttachmentState{
+                    blend: Some(AttachmentBlend{
+                        dst_alpha_blend_factor: BlendFactor::Zero,
+                        ..AttachmentBlend::alpha()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            subpass: Some(Subpass::from(RenderPass::new(device.clone(), RenderPassCreateInfo{
+                attachments: vec![AttachmentDescription{
+                    format: swap_chain.image_format(),
+                    samples: SampleCount::Sample1,
+                    load_op: AttachmentLoadOp::Clear,
+                    store_op: AttachmentStoreOp::Store,
+                    stencil_load_op: Some(AttachmentLoadOp::DontCare),
+                    stencil_store_op: Some(AttachmentStoreOp::DontCare),
+                    initial_layout: ImageLayout::Undefined,
+                    final_layout: ImageLayout::PresentSrc,
+                    ..Default::default()
+                }],
+                subpasses: vec![SubpassDescription{
+                    color_attachments: vec![Some(AttachmentReference{
+                        layout: ImageLayout::ColorAttachmentOptimal,
+                        ..Default::default()
+                    })],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }).expect("Failed to create render pass"), 0).unwrap().into()),
+            ..GraphicsPipelineCreateInfo::layout(PipelineLayout::new(device.clone(), PipelineLayoutCreateInfo {
+                set_layouts: vec![],
+                ..Default::default()
+            }).expect("Failed to create shader layout"))
+        }
+    ).expect("Failed to create graphics pipeline")
 }

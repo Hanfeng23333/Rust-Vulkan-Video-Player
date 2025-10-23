@@ -1,3 +1,5 @@
 /target
 .idea
 Cargo.lock
+shaders/compile.bat
+shaders/output
