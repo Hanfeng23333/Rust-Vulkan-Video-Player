@@ -3,6 +3,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::sync::Arc;
+use vulkano::command_buffer::allocator::{CommandBufferAllocator, StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo};
+use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferExecFuture, CommandBufferUsage, PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags};
 use vulkano::format::Format;
@@ -11,25 +13,29 @@ use vulkano::image::view::{ImageView, ImageViewCreateInfo};
 use vulkano::image::{Image, ImageAspects, ImageLayout, ImageSubresourceRange, ImageUsage, SampleCount};
 use vulkano::instance::debug::{DebugUtilsMessageSeverity, DebugUtilsMessageType, DebugUtilsMessenger, DebugUtilsMessengerCallback, DebugUtilsMessengerCallbackData, DebugUtilsMessengerCreateInfo};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions};
+use vulkano::memory::allocator::MemoryAllocator;
 use vulkano::pipeline::graphics::color_blend::{AttachmentBlend, BlendFactor, ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
+use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::{CullMode, FrontFace, RasterizationState};
-use vulkano::pipeline::graphics::viewport::ViewportState;
+use vulkano::pipeline::graphics::vertex_input::VertexInputState;
+use vulkano::pipeline::graphics::viewport::{Scissor, Viewport, ViewportState};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::PipelineLayoutCreateInfo;
 use vulkano::pipeline::{DynamicState, GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo};
-use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, RenderPass, RenderPassCreateInfo, Subpass, SubpassDescription};
+use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, Framebuffer, FramebufferCreateInfo, RenderPass, RenderPassCreateInfo, Subpass, SubpassDescription};
 use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo};
-use vulkano::swapchain::{ColorSpace, PresentMode, Surface, Swapchain, SwapchainCreateInfo};
-use vulkano::sync::Sharing;
-use vulkano::{shader, Version, VulkanLibrary};
-use vulkano::pipeline::graphics::multisample::MultisampleState;
-use vulkano::pipeline::graphics::vertex_input::VertexInputState;
+use vulkano::swapchain::{acquire_next_image, ColorSpace, PresentFuture, PresentMode, Surface, Swapchain, SwapchainAcquireFuture, SwapchainCreateInfo, SwapchainPresentInfo};
+use vulkano::sync::future::{FenceSignalFuture, JoinFuture};
+use vulkano::sync::{GpuFuture, Sharing};
+use vulkano::{shader, sync, Validated, Version, VulkanError, VulkanLibrary};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowAttributes, WindowId};
+
+const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
 //Structs
 #[derive(Default)]
@@ -49,7 +55,18 @@ pub struct Vulkan_application{
     swap_chain: Option<Arc<Swapchain>>,
     swap_chain_images: Vec<Arc<Image>>,
     swap_chain_image_views: Vec<Arc<ImageView>>,
+    swap_chain_frame_buffers: Vec<Arc<Framebuffer>>,
     graphics_pipeline: Option<Arc<GraphicsPipeline>>,
+    render_pass: Option<Arc<RenderPass>>,
+    command_buffers: Vec<Arc<PrimaryAutoCommandBuffer>>,
+    fences: Vec<Option<Arc<FenceSignalFuture<PresentFuture<CommandBufferExecFuture<JoinFuture<Box<dyn GpuFuture>, SwapchainAcquireFuture>>>>>>>, //Type placeholder `_` not allowed in item's signature [E0121] :(
+
+    //Allocators
+    memory_allocator: Option<Arc<dyn MemoryAllocator>>,
+    command_buffer_allocator: Option<Arc<dyn CommandBufferAllocator>>,
+
+    //Runtime attributes
+    current_frame: usize,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -134,8 +151,66 @@ impl Vulkan_application{
         }).collect();
 
         //Graphics pipeline
-        let graphics_pipeline = get_graphics_pipeline(device.clone(), swap_chain.clone());
+        let (graphics_pipeline, render_pass) = get_graphics_pipeline_and_render_pass(device.clone(), swap_chain.clone());
         self.graphics_pipeline = Some(graphics_pipeline.clone());
+        self.render_pass = Some(render_pass.clone());
+
+        //Frame buffers
+        self.swap_chain_frame_buffers = self.swap_chain_image_views.iter().
+            map(|image_view| Framebuffer::new(render_pass.clone(), FramebufferCreateInfo{
+                attachments: vec![image_view.clone()],
+                extent: swap_chain.image_extent(),
+                layers: 1,
+                ..Default::default()
+            }).expect("Failed to create frame buffer")).collect();
+
+        //Command buffer
+        let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(device.clone(), StandardCommandBufferAllocatorCreateInfo::default()));
+        self.command_buffer_allocator = Some(command_buffer_allocator.clone());
+        self.command_buffers = get_command_buffers(command_buffer_allocator.clone(), device.clone(), &queue_family, &self.swap_chain_frame_buffers, graphics_pipeline.clone());
+
+        //Sync objects
+        self.fences = vec![None; MAX_FRAMES_IN_FLIGHT];
+    }
+
+    fn draw_frame(&mut self) {
+        if let Some(fence) = self.fences[self.current_frame].clone(){
+            fence.wait(None).unwrap();
+        }
+
+        let (index, suboptimal, acquire_future) = match acquire_next_image(self.swap_chain.as_ref().unwrap().clone(), None).map_err(Validated::unwrap){
+            Ok(data) => data,
+            Err(VulkanError::OutOfDate) => {
+                return;
+            }
+            Err(e) => panic!("Failed to acquire next image: {}", e),
+        };
+
+        let future = match self.fences[self.current_frame].clone() {
+            Some(fence) => fence.boxed(),
+            None => {
+                let mut current = sync::now(self.device.as_ref().unwrap().clone());
+                current.cleanup_finished();
+                current.boxed()
+            }
+        }
+            .join(acquire_future)
+            .then_execute(self.queues["graphics"].as_ref().unwrap().clone(), self.command_buffers[index as usize].clone()).unwrap()
+            .then_swapchain_present(self.queues["graphics"].as_ref().unwrap().clone(), SwapchainPresentInfo::swapchain_image_index(self.swap_chain.as_ref().unwrap().clone(), index))
+            .then_signal_fence_and_flush();
+
+        self.fences[self.current_frame] = match future.map_err(Validated::unwrap){
+            Ok(fence) => Some(Arc::new(fence)),
+            Err(VulkanError::OutOfDate) => {
+                None
+            }
+            Err(error) =>{
+                eprintln!("Failed to acquire next image: {}", error);
+                None
+            }
+        };
+
+        self.current_frame = (self.current_frame+1)%MAX_FRAMES_IN_FLIGHT;
     }
     
     pub fn run(&mut self){
@@ -158,6 +233,10 @@ impl ApplicationHandler for Vulkan_application{
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
+            },
+            WindowEvent::RedrawRequested => {
+               self.draw_frame();
+                self.window.as_ref().unwrap().request_redraw();
             }
             _ => ()
         }
@@ -191,8 +270,8 @@ impl Queue_family_indices {
 
     fn collect_dict(&self) -> HashMap<String, Option<u32>>{
         [
-            ("graphics_family".to_string(), self.graphics_family),
-            ("present_family".to_string(), self.present_family)
+            ("graphics".to_string(), self.graphics_family),
+            ("present".to_string(), self.present_family)
         ].into_iter().collect()
     }
     
@@ -394,17 +473,36 @@ fn get_shader(file_path: String, device: Arc<Device>) -> Arc<ShaderModule>{
             .expect("Failed to create shader module")
     }
 }
-fn get_graphics_pipeline(device: Arc<Device>, swap_chain: Arc<Swapchain>) -> Arc<GraphicsPipeline> {
-    //Shaders
-    let vertex_shader = get_shader("shaders/vert.spv".to_string(), device.clone());
-    let fragment_shader = get_shader("shaders/frag.spv".to_string(), device.clone());
+fn get_graphics_pipeline_and_render_pass(device: Arc<Device>, swap_chain: Arc<Swapchain>) -> (Arc<GraphicsPipeline>, Arc<RenderPass>) {
+    //Render pass
+    let render_pass = RenderPass::new(device.clone(), RenderPassCreateInfo{
+        attachments: vec![AttachmentDescription{
+            format: swap_chain.image_format(),
+            samples: SampleCount::Sample1,
+            load_op: AttachmentLoadOp::Clear,
+            store_op: AttachmentStoreOp::Store,
+            stencil_load_op: Some(AttachmentLoadOp::DontCare),
+            stencil_store_op: Some(AttachmentStoreOp::DontCare),
+            initial_layout: ImageLayout::Undefined,
+            final_layout: ImageLayout::PresentSrc,
+            ..Default::default()
+        }],
+        subpasses: vec![SubpassDescription{
+            color_attachments: vec![Some(AttachmentReference{
+                layout: ImageLayout::ColorAttachmentOptimal,
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }).expect("Failed to create render pass");
 
-    GraphicsPipeline::new(
+    (GraphicsPipeline::new(
         device.clone(), None, GraphicsPipelineCreateInfo{
             stages: [
-                PipelineShaderStageCreateInfo::new(vertex_shader.entry_point("main").unwrap()),
-                PipelineShaderStageCreateInfo::new(fragment_shader.entry_point("main").unwrap()),
-            ].into_iter().collect(),
+                "shaders/vert.spv",
+                "shaders/frag.spv"
+            ].into_iter().map(|shader_file| PipelineShaderStageCreateInfo::new(get_shader(shader_file.to_string(), device.clone()).entry_point("main").unwrap())).collect(),
             dynamic_state: [DynamicState::Viewport, DynamicState::Scissor].into_iter().collect(),
             vertex_input_state: Some(VertexInputState::default()),
             input_assembly_state: Some(InputAssemblyState::default()),
@@ -425,31 +523,44 @@ fn get_graphics_pipeline(device: Arc<Device>, swap_chain: Arc<Swapchain>) -> Arc
                 }],
                 ..Default::default()
             }),
-            subpass: Some(Subpass::from(RenderPass::new(device.clone(), RenderPassCreateInfo{
-                attachments: vec![AttachmentDescription{
-                    format: swap_chain.image_format(),
-                    samples: SampleCount::Sample1,
-                    load_op: AttachmentLoadOp::Clear,
-                    store_op: AttachmentStoreOp::Store,
-                    stencil_load_op: Some(AttachmentLoadOp::DontCare),
-                    stencil_store_op: Some(AttachmentStoreOp::DontCare),
-                    initial_layout: ImageLayout::Undefined,
-                    final_layout: ImageLayout::PresentSrc,
-                    ..Default::default()
-                }],
-                subpasses: vec![SubpassDescription{
-                    color_attachments: vec![Some(AttachmentReference{
-                        layout: ImageLayout::ColorAttachmentOptimal,
-                        ..Default::default()
-                    })],
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }).expect("Failed to create render pass"), 0).unwrap().into()),
+            subpass: Some(Subpass::from(render_pass.clone(), 0).unwrap().into()),
             ..GraphicsPipelineCreateInfo::layout(PipelineLayout::new(device.clone(), PipelineLayoutCreateInfo {
                 set_layouts: vec![],
                 ..Default::default()
             }).expect("Failed to create shader layout"))
         }
-    ).expect("Failed to create graphics pipeline")
+    ).expect("Failed to create graphics pipeline"), render_pass)
+}
+
+fn get_command_buffers(allocator: Arc<dyn CommandBufferAllocator>, device: Arc<Device>, indices: &Queue_family_indices, frame_buffers: &[Arc<Framebuffer>], graphics_pipeline: Arc<GraphicsPipeline>) -> Vec<Arc<PrimaryAutoCommandBuffer>> {
+    frame_buffers.iter().map(|frame_buffer| {
+        let mut builder = AutoCommandBufferBuilder::primary(
+            allocator.clone(), indices.graphics_family.unwrap(), CommandBufferUsage::MultipleSubmit).unwrap();
+
+        //Command record
+        unsafe {
+            builder
+                .begin_render_pass(RenderPassBeginInfo{
+                    clear_values: vec![Some([0.0, 0.0, 0.0, 1.0].into())],
+                    ..RenderPassBeginInfo::framebuffer(frame_buffer.clone())
+                }, SubpassBeginInfo{
+                    contents: SubpassContents::Inline,
+                    ..Default::default()
+                }).unwrap()
+                .bind_pipeline_graphics(graphics_pipeline.clone()).unwrap()
+                .set_viewport(0, [Viewport{
+                    extent: frame_buffer.extent().map(|i| i as f32),
+                    ..Default::default()
+                }
+                ].into_iter().collect()).unwrap()
+                .set_scissor(0, [Scissor{
+                    extent: frame_buffer.extent(),
+                    ..Default::default()
+                }].into_iter().collect()).unwrap()
+                .draw(3,1,0,0).unwrap()
+                .end_render_pass(SubpassEndInfo::default()).unwrap();
+        }
+
+        builder.build().unwrap()
+    }).collect()
 }
