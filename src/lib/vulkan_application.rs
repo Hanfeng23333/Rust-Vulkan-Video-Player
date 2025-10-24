@@ -1,5 +1,5 @@
 //Made by Han_feng
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::Read;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use vulkano::image::view::{ImageView, ImageViewCreateInfo};
 use vulkano::image::{Image, ImageAspects, ImageLayout, ImageSubresourceRange, ImageUsage, SampleCount};
 use vulkano::instance::debug::{DebugUtilsMessageSeverity, DebugUtilsMessageType, DebugUtilsMessenger, DebugUtilsMessengerCallback, DebugUtilsMessengerCallbackData, DebugUtilsMessengerCreateInfo};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions};
-use vulkano::memory::allocator::MemoryAllocator;
+use vulkano::memory::allocator::{MemoryAllocator, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::color_blend::{AttachmentBlend, BlendFactor, ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
@@ -24,11 +24,11 @@ use vulkano::pipeline::graphics::viewport::{Scissor, Viewport, ViewportState};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::PipelineLayoutCreateInfo;
 use vulkano::pipeline::{DynamicState, GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo};
-use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, Framebuffer, FramebufferCreateInfo, RenderPass, RenderPassCreateInfo, Subpass, SubpassDescription};
+use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, Framebuffer, FramebufferCreateInfo, RenderPass, RenderPassCreateInfo, Subpass, SubpassDependency, SubpassDescription};
 use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo};
 use vulkano::swapchain::{acquire_next_image, ColorSpace, PresentFuture, PresentMode, Surface, Swapchain, SwapchainAcquireFuture, SwapchainCreateInfo, SwapchainPresentInfo};
 use vulkano::sync::future::{FenceSignalFuture, JoinFuture};
-use vulkano::sync::{GpuFuture, Sharing};
+use vulkano::sync::{AccessFlags, GpuFuture, PipelineStages, Sharing};
 use vulkano::{shader, sync, Validated, Version, VulkanError, VulkanLibrary};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -37,11 +37,11 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
+const IMAGE_EXTENSION: u32 = 2;
 #[cfg(debug_assertions)]
 const FPS_COUNT_INTERVAL: u64 = 5;
 
 //Structs
-#[derive(Default)]
 pub struct Vulkan_application{
     //Window attributes
     event_loop: Option<EventLoop<()>>,
@@ -49,34 +49,44 @@ pub struct Vulkan_application{
     window: Option<Arc<Window>>,
     
     //Vulkan attributes
-    instance: Option<Arc<Instance>>,
+    instance: Arc<Instance>,
     _debug_messenger: Option<DebugUtilsMessenger>,
-    physical_device: Option<Arc<PhysicalDevice>>,
-    device: Option<Arc<Device>>,
-    queues: HashMap<String, Option<Arc<Queue>>>,
-    surface: Option<Arc<Surface>>,
-    swap_chain: Option<Arc<Swapchain>>,
+    render_context: Option<Render_context>,
+}
+
+#[derive(Default, Clone)]
+struct Queue_family_indices{
+    graphics_family: Option<u32>,
+    present_family: Option<u32>,
+
+    //Iterator
+    elements: Option<VecDeque<u32>>,
+}
+
+struct Render_context{
+    physical_device: Arc<PhysicalDevice>,
+    indices: Queue_family_indices,
+    device: Arc<Device>,
+    graphics_queue: Arc<Queue>,
+    present_queue: Arc<Queue>,
+    surface: Arc<Surface>,
+    swap_chain: Arc<Swapchain>,
     swap_chain_images: Vec<Arc<Image>>,
     swap_chain_image_views: Vec<Arc<ImageView>>,
-    swap_chain_frame_buffers: Vec<Arc<Framebuffer>>,
-    graphics_pipeline: Option<Arc<GraphicsPipeline>>,
-    render_pass: Option<Arc<RenderPass>>,
-    command_buffers: Vec<Arc<PrimaryAutoCommandBuffer>>,
+    frame_buffers: Vec<Arc<Framebuffer>>,
+    graphics_pipeline: Arc<GraphicsPipeline>,
+    render_pass: Arc<RenderPass>,
     fences: Vec<Option<Arc<FenceSignalFuture<PresentFuture<CommandBufferExecFuture<JoinFuture<Box<dyn GpuFuture>, SwapchainAcquireFuture>>>>>>>, //Type placeholder `_` not allowed in item's signature [E0121] :(
 
     //Allocators
-    memory_allocator: Option<Arc<dyn MemoryAllocator>>,
-    command_buffer_allocator: Option<Arc<dyn CommandBufferAllocator>>,
+    memory_allocator: Arc<dyn MemoryAllocator>,
+    command_buffer_allocator: Arc<dyn CommandBufferAllocator>,
 
     //Runtime attributes
     current_frame: usize,
-    #[cfg(debug_assertions)] fps_counter: Option<FPS_counter>,
-}
-
-#[derive(Default, Clone, Copy)]
-struct Queue_family_indices{
-    present_family: Option<u32>,
-    graphics_family: Option<u32>,
+    refresh_swap_chain: bool,
+    command_buffers: Vec<Arc<PrimaryAutoCommandBuffer>>,
+    #[cfg(debug_assertions)] fps_counter: FPS_counter,
 }
 
 #[cfg(debug_assertions)]
@@ -90,139 +100,34 @@ impl Vulkan_application{
     pub fn new(title: String, size:(f64, f64)) -> Vulkan_application{
         //Window attributes
         let event_loop = Some(EventLoop::new().expect("Failed to create event loop"));
-        let window_attributes = WindowAttributes::default()
-            .with_title(title)
-            .with_inner_size(LogicalSize::new(size.0, size.1));
 
         //Vulkan attributes
-        let instance = Some(get_vulkan_instance(event_loop.as_ref().unwrap()));
+        let instance = get_vulkan_instance(event_loop.as_ref().unwrap());
+        let _debug_messenger = if cfg!(debug_assertions){
+            Some(DebugUtilsMessenger::new(instance.clone(), DebugUtilsMessengerCreateInfo{
+                message_severity: DebugUtilsMessageSeverity::ERROR | DebugUtilsMessageSeverity::WARNING | DebugUtilsMessageSeverity::VERBOSE,
+                message_type: DebugUtilsMessageType::GENERAL | DebugUtilsMessageType::PERFORMANCE | DebugUtilsMessageType::VALIDATION,
+                ..DebugUtilsMessengerCreateInfo::user_callback(unsafe { DebugUtilsMessengerCallback::new(debug_callback) })
+            }).unwrap())
+        }
+        else{
+            None
+        };
         
         Vulkan_application{
             //Window
             event_loop,
-            window_attributes,
+            window: None,
+            window_attributes: WindowAttributes::default()
+                .with_title(title)
+                .with_inner_size(LogicalSize::new(size.0, size.1)),
 
             //Vulkan
-            instance,
-
-            //Default
-            ..Default::default()
+            instance, _debug_messenger,
+            render_context: None,
         }
     }
 
-    fn init_vulkan(&mut self) {
-        let instance = self.instance.as_ref().unwrap().clone();
-        let window = self.window.as_ref().unwrap().clone();
-
-        //Surface
-        let surface = Surface::from_window(instance.clone(), self.window.as_ref().unwrap().clone()).unwrap();
-        self.surface = Some(surface.clone());
-
-        //Debug messenger
-        #[cfg(debug_assertions)]
-        {
-            self._debug_messenger = Some(DebugUtilsMessenger::new(instance.clone(), DebugUtilsMessengerCreateInfo{
-                message_severity: DebugUtilsMessageSeverity::ERROR | DebugUtilsMessageSeverity::WARNING | DebugUtilsMessageSeverity::VERBOSE,
-                message_type: DebugUtilsMessageType::GENERAL | DebugUtilsMessageType::PERFORMANCE | DebugUtilsMessageType::VALIDATION,
-                ..DebugUtilsMessengerCreateInfo::user_callback(unsafe { DebugUtilsMessengerCallback::new(debug_callback) })
-            }).unwrap());
-        }
-
-        //Physical Device
-        let device_extensions = DeviceExtensions{
-            khr_swapchain: true,
-            ..Default::default()
-        };
-        let (physical_device, queue_family) = get_physical_device_and_indices(instance.clone(), surface.clone(), &device_extensions);
-        self.physical_device = Some(physical_device.clone());
-
-        //Device
-        let (device, queues) = get_device_and_queues::<Vec<Arc<Queue>>>(physical_device.clone(), &queue_family, device_extensions);
-        self.device = Some(device.clone());
-        self.queues = queue_family.collect_dict().into_iter().map(|(name, i)|{
-            (name, i.map(|family| queues.iter().find(|q| q.queue_family_index() == family).unwrap().clone()))
-        }).collect();
-        
-        //Swap chain
-        let (swap_chain, images) = get_swap_chain_and_images(physical_device.clone(), queue_family.clone(), device.clone(), surface.clone(), window.clone());
-        self.swap_chain = Some(swap_chain.clone());
-        self.swap_chain_images = images;
-        self.swap_chain_image_views = self.swap_chain_images.iter().map(|image| {
-            ImageView::new(image.clone(), ImageViewCreateInfo{
-                format: swap_chain.image_format(),
-                component_mapping: ComponentMapping::identity(),
-                subresource_range: ImageSubresourceRange{
-                    aspects: ImageAspects::COLOR,
-                    mip_levels: 0..1,
-                    array_layers: 0..1
-                },
-                ..Default::default()
-            }).expect("Failed to create swap chain image view")
-        }).collect();
-
-        //Graphics pipeline
-        let (graphics_pipeline, render_pass) = get_graphics_pipeline_and_render_pass(device.clone(), swap_chain.clone());
-        self.graphics_pipeline = Some(graphics_pipeline.clone());
-        self.render_pass = Some(render_pass.clone());
-
-        //Frame buffers
-        self.swap_chain_frame_buffers = self.swap_chain_image_views.iter().
-            map(|image_view| Framebuffer::new(render_pass.clone(), FramebufferCreateInfo{
-                attachments: vec![image_view.clone()],
-                extent: swap_chain.image_extent(),
-                layers: 1,
-                ..Default::default()
-            }).expect("Failed to create frame buffer")).collect();
-
-        //Command buffer
-        let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(device.clone(), StandardCommandBufferAllocatorCreateInfo::default()));
-        self.command_buffer_allocator = Some(command_buffer_allocator.clone());
-        self.command_buffers = get_command_buffers(command_buffer_allocator.clone(), device.clone(), &queue_family, &self.swap_chain_frame_buffers, graphics_pipeline.clone());
-
-        //Sync objects
-        self.fences = vec![None; MAX_FRAMES_IN_FLIGHT];
-    }
-
-    fn draw_frame(&mut self) {
-        if let Some(fence) = self.fences[self.current_frame].clone(){
-            fence.wait(None).unwrap();
-        }
-
-        let (index, suboptimal, acquire_future) = match acquire_next_image(self.swap_chain.as_ref().unwrap().clone(), None).map_err(Validated::unwrap){
-            Ok(data) => data,
-            Err(VulkanError::OutOfDate) => {
-                return;
-            }
-            Err(e) => panic!("Failed to acquire next image: {}", e),
-        };
-
-        let future = match self.fences[self.current_frame].clone() {
-            Some(fence) => fence.boxed(),
-            None => {
-                let mut current = sync::now(self.device.as_ref().unwrap().clone());
-                current.cleanup_finished();
-                current.boxed()
-            }
-        }
-            .join(acquire_future)
-            .then_execute(self.queues["graphics"].as_ref().unwrap().clone(), self.command_buffers[index as usize].clone()).unwrap()
-            .then_swapchain_present(self.queues["graphics"].as_ref().unwrap().clone(), SwapchainPresentInfo::swapchain_image_index(self.swap_chain.as_ref().unwrap().clone(), index))
-            .then_signal_fence_and_flush();
-
-        self.fences[self.current_frame] = match future.map_err(Validated::unwrap){
-            Ok(fence) => Some(Arc::new(fence)),
-            Err(VulkanError::OutOfDate) => {
-                None
-            }
-            Err(error) =>{
-                eprintln!("Failed to acquire next image: {}", error);
-                None
-            }
-        };
-
-        self.current_frame = (self.current_frame+1)%MAX_FRAMES_IN_FLIGHT;
-    }
-    
     pub fn run(&mut self){
         let event_loop = self.event_loop.take().expect("Failed to get event loop");
         event_loop.run_app(self).expect("Failed to run vulkan application");
@@ -234,8 +139,8 @@ impl ApplicationHandler for Vulkan_application{
         if self.window.is_none(){
             let window = Arc::new(event_loop.create_window(self.window_attributes.clone()).expect("Failed to create window"));
             self.window = Some(window.clone());
-
-            self.init_vulkan();
+            self.render_context = Some(Render_context::new(self.instance.clone(), window.clone()));
+            self.render_context.as_mut().unwrap().fps_counter.reset();
         }
     }
 
@@ -244,22 +149,23 @@ impl ApplicationHandler for Vulkan_application{
             WindowEvent::CloseRequested => {
                 event_loop.exit();
             },
+            WindowEvent::Resized(_) => {
+                self.render_context.as_mut().unwrap().refresh_swap_chain = true;
+            }
             WindowEvent::RedrawRequested => {
-               self.draw_frame();
+                let render_context = self.render_context.as_mut().unwrap();
+                let window = self.window.as_ref().unwrap();
+
+                render_context.draw_frame(window.clone());
 
                 #[cfg(debug_assertions)]
                 {
-                    if let Some(fps_counter) = self.fps_counter.as_mut() {
-                        if let Some(fps) = fps_counter.update(FPS_COUNT_INTERVAL){
-                            println!("FPS: {}", fps);
-                        }
-                    }
-                    else{
-                        self.fps_counter = Some(FPS_counter::new());
+                    if let Some(fps) = render_context.fps_counter.update(FPS_COUNT_INTERVAL){
+                        println!("FPS: {}", fps);
                     }
                 }
 
-                self.window.as_ref().unwrap().request_redraw();
+                window.request_redraw();
             }
             _ => ()
         }
@@ -290,49 +196,141 @@ impl Queue_family_indices {
     fn is_complete(&self) -> bool{
         self.graphics_family.is_some() && self.present_family.is_some()
     }
+}
 
-    fn collect_dict(&self) -> HashMap<String, Option<u32>>{
-        [
-            ("graphics".to_string(), self.graphics_family),
-            ("present".to_string(), self.present_family)
-        ].into_iter().collect()
-    }
-    
-    fn collect_info<T>(&self) -> T
-    where T: FromIterator<QueueCreateInfo>
-    {
-        HashSet::from([self.graphics_family, self.present_family])
-            .into_iter().filter_map(|i| {
-            if let Some(index) = i{
-                Some(QueueCreateInfo{
-                    queue_family_index: index,
-                    ..Default::default()
-                })
-            }
-            else{
-                None
-            }
-        }).collect()
+impl Iterator for Queue_family_indices {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.elements.is_none(){
+            self.elements = Some([self.graphics_family, self.present_family].into_iter().flatten().collect());
+        }
+
+        self.elements.as_mut().unwrap().pop_front()
     }
 }
 
-impl IntoIterator for Queue_family_indices {
-    type Item = u32;
-    type IntoIter = std::vec::IntoIter<Self::Item>;
+impl Render_context {
+    fn new(instance: Arc<Instance>, window: Arc<Window>) -> Render_context{
+        //Surface
+        let surface = Surface::from_window(instance.clone(), window.clone()).expect("Failed to create surface");
 
-    fn into_iter(self) -> Self::IntoIter {
-        let mut result = vec![];
-        result.extend(self.graphics_family);
-        result.extend(self.present_family);
-        result.into_iter()
+        //Physical Device
+        let device_extensions = DeviceExtensions{
+            khr_swapchain: true,
+            ..Default::default()
+        };
+        let (physical_device, indices) = get_physical_device_and_indices(instance.clone(), surface.clone(), &device_extensions);
+
+        //Device
+        let (device, queues) = get_device_and_queues::<Vec<Arc<Queue>>>(physical_device.clone(), indices.clone(), device_extensions);
+
+        //Queues
+        let graphics_queue = queues.iter().find(|q| q.queue_family_index() == indices.graphics_family.unwrap()).unwrap().clone();
+        let present_queue = queues.iter().find(|q| q.queue_family_index() == indices.present_family.unwrap()).unwrap().clone();
+
+        //Swap chain
+        let (swap_chain, swap_chain_images) = get_swap_chain_and_images(physical_device.clone(), indices.clone(), device.clone(), surface.clone(), window.clone());
+
+        //Graphics pipeline
+        let (graphics_pipeline, render_pass) = get_graphics_pipeline_and_render_pass(device.clone(), swap_chain.clone());
+
+        //Image views and frame buffers
+        let (swap_chain_image_views, frame_buffers) = get_image_views_and_frame_buffers(swap_chain.clone(), &swap_chain_images, render_pass.clone());
+
+        //Allocators
+        let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
+        let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(device.clone(), StandardCommandBufferAllocatorCreateInfo::default()));
+
+        //Command buffers
+        let command_buffers:Vec<_> = frame_buffers.iter().map(|frame_buffer| get_command_buffer(command_buffer_allocator.clone(), CommandBufferUsage::MultipleSubmit, &indices, frame_buffer.clone(), graphics_pipeline.clone())).collect();
+
+        Render_context{
+            physical_device, indices, device, graphics_queue, present_queue, surface, swap_chain, swap_chain_images, swap_chain_image_views, frame_buffers, command_buffers, graphics_pipeline, render_pass, memory_allocator, command_buffer_allocator,
+            fences: vec![None; MAX_FRAMES_IN_FLIGHT],
+            current_frame: 0,
+            refresh_swap_chain: false,
+            fps_counter: FPS_counter::new()
+        }
+    }
+
+    fn recreate_swap_chain(&mut self, window: Arc<Window>) {
+        unsafe { self.device.wait_idle().expect("Failed to wait on device idle"); }
+
+        //Swap chain
+        let (swap_chain, images) = self.swap_chain.recreate(SwapchainCreateInfo{
+            image_extent: window.inner_size().into(),
+            ..self.swap_chain.create_info()
+        }).expect("Failed to recreate swap chain image");
+        self.swap_chain = swap_chain.clone();
+        self.swap_chain_images = images;
+
+        let (image_views, frame_buffers) = get_image_views_and_frame_buffers(swap_chain.clone(), &self.swap_chain_images, self.render_pass.clone());
+        self.swap_chain_image_views = image_views;
+        self.command_buffers = frame_buffers.iter().map(|frame_buffer| get_command_buffer(self.command_buffer_allocator.clone(), CommandBufferUsage::MultipleSubmit, &self.indices, frame_buffer.clone(), self.graphics_pipeline.clone())).collect();
+        self.frame_buffers = frame_buffers;
+    }
+
+    fn draw_frame(&mut self, window: Arc<Window>) {
+        if self.refresh_swap_chain{
+            self.refresh_swap_chain = false;
+            self.recreate_swap_chain(window);
+        }
+
+        if let Some(fence) = self.fences[self.current_frame].clone(){
+            fence.wait(None).unwrap();
+        }
+
+        let (index, suboptimal, acquire_future) = match acquire_next_image(self.swap_chain.clone(), None).map_err(Validated::unwrap){
+            Ok(data) => data,
+            Err(VulkanError::OutOfDate) => {
+                return;
+            }
+            Err(e) => panic!("Failed to acquire next image: {}", e),
+        };
+
+        if suboptimal{
+            self.refresh_swap_chain = true;
+            return;
+        }
+
+        let future = match self.fences[self.current_frame].clone() {
+            Some(fence) => fence.boxed(),
+            None => {
+                let mut current = sync::now(self.device.clone());
+                current.cleanup_finished();
+                current.boxed()
+            }
+        }
+            .join(acquire_future)
+            .then_execute(self.graphics_queue.clone(), self.command_buffers[index as usize].clone()).unwrap()
+            .then_swapchain_present(self.present_queue.clone(), SwapchainPresentInfo::swapchain_image_index(self.swap_chain.clone(), index))
+            .then_signal_fence_and_flush();
+
+        self.fences[self.current_frame] = match future.map_err(Validated::unwrap){
+            Ok(fence) => Some(Arc::new(fence)),
+            Err(VulkanError::OutOfDate) => {
+                self.refresh_swap_chain = true;
+                None
+            }
+            Err(error) =>{
+                eprintln!("Failed to acquire next image: {}", error);
+                None
+            }
+        };
+
+        self.current_frame = (self.current_frame+1)%MAX_FRAMES_IN_FLIGHT;
     }
 }
 
 #[cfg(debug_assertions)]
 impl FPS_counter {
     fn new() -> FPS_counter{
-        println!("Starting FPS_counter");
         FPS_counter{fps: 0, previous_time: Instant::now()}
+    }
+
+    fn reset(&mut self){
+        self.previous_time = Instant::now();
     }
 
     fn update(&mut self, interval: u64) -> Option<u64> {
@@ -444,13 +442,19 @@ fn get_physical_device_and_indices(instance: Arc<Instance>, surface: Arc<Surface
     device_pack
 }
 
-fn get_device_and_queues<T>(physical_device: Arc<PhysicalDevice>, queue_family: &Queue_family_indices, enabled_extensions: DeviceExtensions) -> (Arc<Device>, T)
+fn get_device_and_queues<T>(physical_device: Arc<PhysicalDevice>, indices: Queue_family_indices, enabled_extensions: DeviceExtensions) -> (Arc<Device>, T)
 where T: FromIterator<Arc<Queue>>
 {
     let (device, queues) = Device::new(
         physical_device,
         DeviceCreateInfo{
-            queue_create_infos: queue_family.collect_info(),
+            queue_create_infos: indices.collect::<HashSet<_>>()
+                .into_iter().map(|i| {
+                QueueCreateInfo{
+                    queue_family_index: i,
+                    ..Default::default()
+                }
+            }).collect(),
             enabled_extensions,
             ..Default::default()
         }
@@ -494,9 +498,9 @@ fn get_swap_chain_and_images(physical_device: Arc<PhysicalDevice>, indices: Queu
         device, surface, SwapchainCreateInfo{
             image_format, image_color_space, present_mode, image_extent,
             image_usage: ImageUsage::COLOR_ATTACHMENT,
-            min_image_count: (surface_capabilities.min_image_count+5).min(surface_capabilities.max_image_count.unwrap_or(surface_capabilities.min_image_count+5)),
+            min_image_count: (surface_capabilities.min_image_count+IMAGE_EXTENSION).min(surface_capabilities.max_image_count.unwrap_or(surface_capabilities.min_image_count+IMAGE_EXTENSION)),
             image_sharing: if indices.graphics_family != indices.present_family {
-                Sharing::Concurrent(indices.into_iter().collect())
+                Sharing::Concurrent(indices.collect())
             }
             else{
                 Sharing::Exclusive
@@ -505,6 +509,31 @@ fn get_swap_chain_and_images(physical_device: Arc<PhysicalDevice>, indices: Queu
             ..Default::default()
         }
     ).expect("Couldn't create a swap chain")
+}
+
+fn get_image_views_and_frame_buffers(swap_chain: Arc<Swapchain>, images: &[Arc<Image>], render_pass: Arc<RenderPass>) -> (Vec<Arc<ImageView>>, Vec<Arc<Framebuffer>>) {
+    let image_views:Vec<_> = images.iter().map(|image| {
+        ImageView::new(image.clone(), ImageViewCreateInfo{
+            format: swap_chain.image_format(),
+            component_mapping: ComponentMapping::identity(),
+            subresource_range: ImageSubresourceRange{
+                aspects: ImageAspects::COLOR,
+                mip_levels: 0..1,
+                array_layers: 0..1
+            },
+            ..Default::default()
+        }).expect("Failed to create swap chain image view")
+    }).collect();
+
+    let frame_buffers = image_views.iter().
+        map(|image_view| Framebuffer::new(render_pass.clone(), FramebufferCreateInfo{
+            attachments: vec![image_view.clone()],
+            extent: swap_chain.image_extent(),
+            layers: 1,
+            ..Default::default()
+        }).expect("Failed to create frame buffer")).collect();
+
+    (image_views, frame_buffers)
 }
 
 fn get_shader(file_path: String, device: Arc<Device>) -> Arc<ShaderModule>{
@@ -536,6 +565,13 @@ fn get_graphics_pipeline_and_render_pass(device: Arc<Device>, swap_chain: Arc<Sw
                 layout: ImageLayout::ColorAttachmentOptimal,
                 ..Default::default()
             })],
+            ..Default::default()
+        }],
+        dependencies: vec![SubpassDependency{
+            dst_subpass: Some(0),
+            src_stages: PipelineStages::COLOR_ATTACHMENT_OUTPUT,
+            dst_stages: PipelineStages::COLOR_ATTACHMENT_OUTPUT,
+            dst_access: AccessFlags::COLOR_ATTACHMENT_WRITE,
             ..Default::default()
         }],
         ..Default::default()
@@ -576,35 +612,33 @@ fn get_graphics_pipeline_and_render_pass(device: Arc<Device>, swap_chain: Arc<Sw
     ).expect("Failed to create graphics pipeline"), render_pass)
 }
 
-fn get_command_buffers(allocator: Arc<dyn CommandBufferAllocator>, device: Arc<Device>, indices: &Queue_family_indices, frame_buffers: &[Arc<Framebuffer>], graphics_pipeline: Arc<GraphicsPipeline>) -> Vec<Arc<PrimaryAutoCommandBuffer>> {
-    frame_buffers.iter().map(|frame_buffer| {
-        let mut builder = AutoCommandBufferBuilder::primary(
-            allocator.clone(), indices.graphics_family.unwrap(), CommandBufferUsage::MultipleSubmit).unwrap();
+fn get_command_buffer(allocator: Arc<dyn CommandBufferAllocator>, usage: CommandBufferUsage, indices: &Queue_family_indices, frame_buffer: Arc<Framebuffer>, graphics_pipeline: Arc<GraphicsPipeline>) -> Arc<PrimaryAutoCommandBuffer> {
+    let mut builder = AutoCommandBufferBuilder::primary(
+        allocator.clone(), indices.graphics_family.unwrap(), usage).unwrap();
 
-        //Command record
-        unsafe {
-            builder
-                .begin_render_pass(RenderPassBeginInfo{
-                    clear_values: vec![Some([0.0, 0.0, 0.0, 1.0].into())],
-                    ..RenderPassBeginInfo::framebuffer(frame_buffer.clone())
-                }, SubpassBeginInfo{
-                    contents: SubpassContents::Inline,
-                    ..Default::default()
-                }).unwrap()
-                .bind_pipeline_graphics(graphics_pipeline.clone()).unwrap()
-                .set_viewport(0, [Viewport{
-                    extent: frame_buffer.extent().map(|i| i as f32),
-                    ..Default::default()
-                }
-                ].into_iter().collect()).unwrap()
-                .set_scissor(0, [Scissor{
-                    extent: frame_buffer.extent(),
-                    ..Default::default()
-                }].into_iter().collect()).unwrap()
-                .draw(3,1,0,0).unwrap()
-                .end_render_pass(SubpassEndInfo::default()).unwrap();
-        }
+    //Command record
+    unsafe {
+        builder
+            .begin_render_pass(RenderPassBeginInfo{
+                clear_values: vec![Some([0.0, 0.0, 0.0, 1.0].into())],
+                ..RenderPassBeginInfo::framebuffer(frame_buffer.clone())
+            }, SubpassBeginInfo{
+                contents: SubpassContents::Inline,
+                ..Default::default()
+            }).unwrap()
+            .bind_pipeline_graphics(graphics_pipeline.clone()).unwrap()
+            .set_viewport(0, [Viewport{
+                extent: frame_buffer.extent().map(|i| i as f32),
+                ..Default::default()
+            }
+            ].into_iter().collect()).unwrap()
+            .set_scissor(0, [Scissor{
+                extent: frame_buffer.extent(),
+                ..Default::default()
+            }].into_iter().collect()).unwrap()
+            .draw(3,1,0,0).unwrap()
+            .end_render_pass(SubpassEndInfo::default()).unwrap();
+    }
 
-        builder.build().unwrap()
-    }).collect()
+    builder.build().unwrap()
 }
