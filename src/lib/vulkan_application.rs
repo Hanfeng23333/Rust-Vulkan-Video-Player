@@ -14,15 +14,15 @@ use vulkano::image::view::{ImageView, ImageViewCreateInfo};
 use vulkano::image::{Image, ImageAspects, ImageLayout, ImageSubresourceRange, ImageUsage, SampleCount};
 use vulkano::instance::debug::{DebugUtilsMessageSeverity, DebugUtilsMessageType, DebugUtilsMessenger, DebugUtilsMessengerCallback, DebugUtilsMessengerCallbackData, DebugUtilsMessengerCreateInfo};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions};
-use vulkano::memory::allocator::{MemoryAllocator, StandardMemoryAllocator};
+use vulkano::memory::allocator::{AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::color_blend::{AttachmentBlend, BlendFactor, ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::{CullMode, FrontFace, RasterizationState};
-use vulkano::pipeline::graphics::vertex_input::VertexInputState;
+use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexBuffersCollection, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::{Scissor, Viewport, ViewportState};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
-use vulkano::pipeline::layout::PipelineLayoutCreateInfo;
+use vulkano::pipeline::layout::{PipelineDescriptorSetLayoutCreateInfo};
 use vulkano::pipeline::{DynamicState, GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, Framebuffer, FramebufferCreateInfo, RenderPass, RenderPassCreateInfo, Subpass, SubpassDependency, SubpassDescription};
 use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo};
@@ -30,16 +30,27 @@ use vulkano::swapchain::{acquire_next_image, ColorSpace, PresentFuture, PresentM
 use vulkano::sync::future::{FenceSignalFuture, JoinFuture};
 use vulkano::sync::{AccessFlags, GpuFuture, PipelineStages, Sharing};
 use vulkano::{shader, sync, Validated, Version, VulkanError, VulkanLibrary};
+use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, IndexBuffer, Subbuffer};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowAttributes, WindowId};
 
+//Consts
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 const IMAGE_EXTENSION: u32 = 2;
 #[cfg(debug_assertions)]
 const FPS_COUNT_INTERVAL: u64 = 5;
+
+//Vertex resources
+const VERTEX_DATA: [Vertex_data; 4] = [
+    Vertex_data{position: [-0.5, -0.5], color: [1.0, 0.0, 0.0]},
+    Vertex_data{position: [0.5, -0.5], color: [0.0, 1.0, 0.0]},
+    Vertex_data{position: [0.5, 0.5], color: [0.0, 0.0, 1.0]},
+    Vertex_data{position: [-0.5, 0.5], color: [1.0, 1.0, 1.0]},
+];
+const INDICES:[u16; 6] = [0, 1, 2, 2, 3, 0];
 
 //Structs
 pub struct Vulkan_application{
@@ -76,7 +87,8 @@ struct Render_context{
     frame_buffers: Vec<Arc<Framebuffer>>,
     graphics_pipeline: Arc<GraphicsPipeline>,
     render_pass: Arc<RenderPass>,
-    fences: Vec<Option<Arc<FenceSignalFuture<PresentFuture<CommandBufferExecFuture<JoinFuture<Box<dyn GpuFuture>, SwapchainAcquireFuture>>>>>>>, //Type placeholder `_` not allowed in item's signature [E0121] :(
+    vertex_buffer: Subbuffer<[Vertex_data]>,
+    index_buffer: Subbuffer<[u16]>,
 
     //Allocators
     memory_allocator: Arc<dyn MemoryAllocator>,
@@ -86,7 +98,17 @@ struct Render_context{
     current_frame: usize,
     refresh_swap_chain: bool,
     command_buffers: Vec<Arc<PrimaryAutoCommandBuffer>>,
+    fences: Vec<Option<Arc<FenceSignalFuture<PresentFuture<CommandBufferExecFuture<JoinFuture<Box<dyn GpuFuture>, SwapchainAcquireFuture>>>>>>>, //Type placeholder `_` not allowed in item's signature [E0121] :(
     #[cfg(debug_assertions)] fps_counter: FPS_counter,
+}
+
+#[derive(BufferContents, Vertex)]
+#[repr(C)]
+struct Vertex_data{
+    #[format(R32G32_SFLOAT)]
+    position: [f32; 2],
+    #[format(R32G32B32_SFLOAT)]
+    color: [f32; 3],
 }
 
 #[cfg(debug_assertions)]
@@ -242,11 +264,25 @@ impl Render_context {
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(device.clone(), StandardCommandBufferAllocatorCreateInfo::default()));
 
-        //Command buffers
-        let command_buffers:Vec<_> = frame_buffers.iter().map(|frame_buffer| get_command_buffer(command_buffer_allocator.clone(), CommandBufferUsage::MultipleSubmit, &indices, frame_buffer.clone(), graphics_pipeline.clone())).collect();
+        //Buffers
+        let vertex_buffer = Buffer::from_iter(memory_allocator.clone(), BufferCreateInfo{
+            usage: BufferUsage::VERTEX_BUFFER,
+            ..Default::default()
+        }, AllocationCreateInfo{
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        }, VERTEX_DATA).expect("Failed to create vertex buffer");
+        let index_buffer = Buffer::from_iter(memory_allocator.clone(), BufferCreateInfo{
+            usage: BufferUsage::INDEX_BUFFER,
+            ..Default::default()
+        }, AllocationCreateInfo{
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        }, INDICES).expect("Failed to create index buffer");
+        let command_buffers:Vec<_> = frame_buffers.iter().map(|frame_buffer| get_command_buffer(command_buffer_allocator.clone(), CommandBufferUsage::MultipleSubmit, &indices, frame_buffer.clone(), graphics_pipeline.clone(), vertex_buffer.clone(), index_buffer.clone())).collect();
 
         Render_context{
-            physical_device, indices, device, graphics_queue, present_queue, surface, swap_chain, swap_chain_images, swap_chain_image_views, frame_buffers, command_buffers, graphics_pipeline, render_pass, memory_allocator, command_buffer_allocator,
+            physical_device, indices, device, graphics_queue, present_queue, surface, swap_chain, swap_chain_images, swap_chain_image_views, frame_buffers, graphics_pipeline, render_pass, memory_allocator, command_buffer_allocator, vertex_buffer, index_buffer, command_buffers,
             fences: vec![None; MAX_FRAMES_IN_FLIGHT],
             current_frame: 0,
             refresh_swap_chain: false,
@@ -267,7 +303,7 @@ impl Render_context {
 
         let (image_views, frame_buffers) = get_image_views_and_frame_buffers(swap_chain.clone(), &self.swap_chain_images, self.render_pass.clone());
         self.swap_chain_image_views = image_views;
-        self.command_buffers = frame_buffers.iter().map(|frame_buffer| get_command_buffer(self.command_buffer_allocator.clone(), CommandBufferUsage::MultipleSubmit, &self.indices, frame_buffer.clone(), self.graphics_pipeline.clone())).collect();
+        self.command_buffers = frame_buffers.iter().map(|frame_buffer| get_command_buffer(self.command_buffer_allocator.clone(), CommandBufferUsage::MultipleSubmit, &self.indices, frame_buffer.clone(), self.graphics_pipeline.clone(), self.vertex_buffer.clone(), self.index_buffer.clone())).collect();
         self.frame_buffers = frame_buffers;
     }
 
@@ -577,14 +613,29 @@ fn get_graphics_pipeline_and_render_pass(device: Arc<Device>, swap_chain: Arc<Sw
         ..Default::default()
     }).expect("Failed to create render pass");
 
+    //Shaders
+    let vertex_shader = get_shader("shaders/vert.spv".to_string(), device.clone());
+    let fragment_shader = get_shader("shaders/frag.spv".to_string(), device.clone());
+
+    let vertex_entry = vertex_shader.entry_point("main").unwrap();
+    let fragment_entry = fragment_shader.entry_point("main").unwrap();
+
+    let vertex_input_state = Vertex_data::per_vertex().definition(&vertex_entry).unwrap();
+
+    let stages = [
+        vertex_entry, fragment_entry,
+    ].into_iter().map(|shader_entry| PipelineShaderStageCreateInfo::new(shader_entry)).collect();
+
+    //Layout
+    let layout = PipelineLayout::new(device.clone(), PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+        .into_pipeline_layout_create_info(device.clone()).unwrap()).unwrap();
+
+    //Pipeline
     (GraphicsPipeline::new(
         device.clone(), None, GraphicsPipelineCreateInfo{
-            stages: [
-                "shaders/vert.spv",
-                "shaders/frag.spv"
-            ].into_iter().map(|shader_file| PipelineShaderStageCreateInfo::new(get_shader(shader_file.to_string(), device.clone()).entry_point("main").unwrap())).collect(),
+            stages,
             dynamic_state: [DynamicState::Viewport, DynamicState::Scissor].into_iter().collect(),
-            vertex_input_state: Some(VertexInputState::default()),
+            vertex_input_state: Some(vertex_input_state),
             input_assembly_state: Some(InputAssemblyState::default()),
             viewport_state: Some(ViewportState::default()),
             rasterization_state: Some(RasterizationState{
@@ -604,15 +655,12 @@ fn get_graphics_pipeline_and_render_pass(device: Arc<Device>, swap_chain: Arc<Sw
                 ..Default::default()
             }),
             subpass: Some(Subpass::from(render_pass.clone(), 0).unwrap().into()),
-            ..GraphicsPipelineCreateInfo::layout(PipelineLayout::new(device.clone(), PipelineLayoutCreateInfo {
-                set_layouts: vec![],
-                ..Default::default()
-            }).expect("Failed to create shader layout"))
+            ..GraphicsPipelineCreateInfo::layout(layout)
         }
     ).expect("Failed to create graphics pipeline"), render_pass)
 }
 
-fn get_command_buffer(allocator: Arc<dyn CommandBufferAllocator>, usage: CommandBufferUsage, indices: &Queue_family_indices, frame_buffer: Arc<Framebuffer>, graphics_pipeline: Arc<GraphicsPipeline>) -> Arc<PrimaryAutoCommandBuffer> {
+fn get_command_buffer(allocator: Arc<dyn CommandBufferAllocator>, usage: CommandBufferUsage, indices: &Queue_family_indices, frame_buffer: Arc<Framebuffer>, graphics_pipeline: Arc<GraphicsPipeline>, vertex_buffer: impl VertexBuffersCollection, index_buffer: impl Into<IndexBuffer>) -> Arc<PrimaryAutoCommandBuffer> {
     let mut builder = AutoCommandBufferBuilder::primary(
         allocator.clone(), indices.graphics_family.unwrap(), usage).unwrap();
 
@@ -636,7 +684,9 @@ fn get_command_buffer(allocator: Arc<dyn CommandBufferAllocator>, usage: Command
                 extent: frame_buffer.extent(),
                 ..Default::default()
             }].into_iter().collect()).unwrap()
-            .draw(3,1,0,0).unwrap()
+            .bind_vertex_buffers(0, vertex_buffer).unwrap()
+            .bind_index_buffer(index_buffer).unwrap()
+            .draw_indexed(INDICES.len() as u32,1,0,0, 0).unwrap()
             .end_render_pass(SubpassEndInfo::default()).unwrap();
     }
 
