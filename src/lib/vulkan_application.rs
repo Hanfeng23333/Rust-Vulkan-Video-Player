@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::sync::Arc;
+use std::time::Instant;
 use vulkano::command_buffer::allocator::{CommandBufferAllocator, StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferExecFuture, CommandBufferUsage, PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
@@ -36,6 +37,8 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
+#[cfg(debug_assertions)]
+const FPS_COUNT_INTERVAL: u64 = 5;
 
 //Structs
 #[derive(Default)]
@@ -67,12 +70,19 @@ pub struct Vulkan_application{
 
     //Runtime attributes
     current_frame: usize,
+    #[cfg(debug_assertions)] fps_counter: Option<FPS_counter>,
 }
 
 #[derive(Default, Clone, Copy)]
 struct Queue_family_indices{
     present_family: Option<u32>,
     graphics_family: Option<u32>,
+}
+
+#[cfg(debug_assertions)]
+struct FPS_counter{
+    fps: u64,
+    previous_time: Instant,
 }
 
 //Impls
@@ -236,6 +246,19 @@ impl ApplicationHandler for Vulkan_application{
             },
             WindowEvent::RedrawRequested => {
                self.draw_frame();
+
+                #[cfg(debug_assertions)]
+                {
+                    if let Some(fps_counter) = self.fps_counter.as_mut() {
+                        if let Some(fps) = fps_counter.update(FPS_COUNT_INTERVAL){
+                            println!("FPS: {}", fps);
+                        }
+                    }
+                    else{
+                        self.fps_counter = Some(FPS_counter::new());
+                    }
+                }
+
                 self.window.as_ref().unwrap().request_redraw();
             }
             _ => ()
@@ -302,6 +325,27 @@ impl IntoIterator for Queue_family_indices {
         result.extend(self.graphics_family);
         result.extend(self.present_family);
         result.into_iter()
+    }
+}
+
+#[cfg(debug_assertions)]
+impl FPS_counter {
+    fn new() -> FPS_counter{
+        println!("Starting FPS_counter");
+        FPS_counter{fps: 0, previous_time: Instant::now()}
+    }
+
+    fn update(&mut self, interval: u64) -> Option<u64> {
+        self.fps += 1;
+        if self.previous_time.elapsed().as_secs() >= interval {
+            self.previous_time = Instant::now();
+            let result = Some(self.fps/interval);
+            self.fps = 0;
+            result
+        }
+        else {
+            None
+        }
     }
 }
 
