@@ -1,17 +1,18 @@
 //Made by Han_feng
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::Read;
 use std::sync::Arc;
 use std::time::Instant;
+use image::ImageReader;
 use vulkano::command_buffer::allocator::{CommandBufferAllocator, StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferExecFuture, CommandBufferUsage, PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo};
+use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferExecFuture, CommandBufferUsage, CopyBufferToImageInfo, PrimaryAutoCommandBuffer, PrimaryCommandBufferAbstract, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
-use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags};
+use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags};
 use vulkano::format::Format;
-use vulkano::image::sampler::ComponentMapping;
+use vulkano::image::sampler::{BorderColor, ComponentMapping, Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, SamplerMipmapMode};
 use vulkano::image::view::{ImageView, ImageViewCreateInfo};
-use vulkano::image::{Image, ImageAspects, ImageLayout, ImageSubresourceRange, ImageUsage, SampleCount};
+use vulkano::image::{Image, ImageAspects, ImageCreateInfo, ImageLayout, ImageSubresourceRange, ImageTiling, ImageUsage, SampleCount};
 use vulkano::instance::debug::{DebugUtilsMessageSeverity, DebugUtilsMessageType, DebugUtilsMessenger, DebugUtilsMessengerCallback, DebugUtilsMessengerCallbackData, DebugUtilsMessengerCreateInfo};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator};
@@ -22,15 +23,18 @@ use vulkano::pipeline::graphics::rasterization::{CullMode, FrontFace, Rasterizat
 use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexBuffersCollection, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::{Scissor, Viewport, ViewportState};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
-use vulkano::pipeline::layout::{PipelineDescriptorSetLayoutCreateInfo};
-use vulkano::pipeline::{DynamicState, GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo};
+use vulkano::pipeline::layout::{PipelineDescriptorSetLayoutCreateInfo, PipelineLayoutCreateInfo};
+use vulkano::pipeline::{DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, Framebuffer, FramebufferCreateInfo, RenderPass, RenderPassCreateInfo, Subpass, SubpassDependency, SubpassDescription};
-use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo};
+use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo, ShaderStages};
 use vulkano::swapchain::{acquire_next_image, ColorSpace, PresentFuture, PresentMode, Surface, Swapchain, SwapchainAcquireFuture, SwapchainCreateInfo, SwapchainPresentInfo};
 use vulkano::sync::future::{FenceSignalFuture, JoinFuture};
 use vulkano::sync::{AccessFlags, GpuFuture, PipelineStages, Sharing};
 use vulkano::{shader, sync, Validated, Version, VulkanError, VulkanLibrary};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, IndexBuffer, Subbuffer};
+use vulkano::descriptor_set::allocator::{DescriptorSetAllocator, StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo};
+use vulkano::descriptor_set::{DescriptorImageViewInfo, DescriptorSet, WriteDescriptorSet};
+use vulkano::descriptor_set::layout::{DescriptorBindingFlags, DescriptorSetLayout, DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo, DescriptorType};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
@@ -42,13 +46,15 @@ const MAX_FRAMES_IN_FLIGHT: usize = 2;
 const IMAGE_EXTENSION: u32 = 2;
 #[cfg(debug_assertions)]
 const FPS_COUNT_INTERVAL: u64 = 5;
+const VERTEX_SHADER_PATH: &'static str = "assets/shaders/vert.spv";
+const FRAGMENT_SHADER_PATH: &'static str = "assets/shaders/frag.spv";
 
 //Vertex resources
 const VERTEX_DATA: [Vertex_data; 4] = [
-    Vertex_data{position: [-0.5, -0.5], color: [1.0, 0.0, 0.0]},
-    Vertex_data{position: [0.5, -0.5], color: [0.0, 1.0, 0.0]},
-    Vertex_data{position: [0.5, 0.5], color: [0.0, 0.0, 1.0]},
-    Vertex_data{position: [-0.5, 0.5], color: [1.0, 1.0, 1.0]},
+    Vertex_data{position: [-1.0, -1.0], color: [1.0, 0.0, 0.0], tex_coord: [0.0, 0.0]},
+    Vertex_data{position: [1.0, -1.0], color: [0.0, 1.0, 0.0], tex_coord: [1.0, 0.0]},
+    Vertex_data{position: [1.0, 1.0], color: [0.0, 0.0, 1.0], tex_coord: [1.0, 1.0]},
+    Vertex_data{position: [-1.0, 1.0], color: [1.0, 1.0, 1.0], tex_coord: [0.0, 1.0]},
 ];
 const INDICES:[u16; 6] = [0, 1, 2, 2, 3, 0];
 
@@ -76,7 +82,6 @@ struct Queue_family_indices{
 
 struct Render_context{
     physical_device: Arc<PhysicalDevice>,
-    indices: Queue_family_indices,
     device: Arc<Device>,
     graphics_queue: Arc<Queue>,
     present_queue: Arc<Queue>,
@@ -89,10 +94,15 @@ struct Render_context{
     render_pass: Arc<RenderPass>,
     vertex_buffer: Subbuffer<[Vertex_data]>,
     index_buffer: Subbuffer<[u16]>,
+    descriptor_set: Arc<DescriptorSet>,
+    texture_image: Arc<Image>,
+    texture_image_view: Arc<ImageView>,
+    sampler: Arc<Sampler>,
 
     //Allocators
     memory_allocator: Arc<dyn MemoryAllocator>,
     command_buffer_allocator: Arc<dyn CommandBufferAllocator>,
+    descriptor_set_allocator: Arc<dyn DescriptorSetAllocator>,
 
     //Runtime attributes
     current_frame: usize,
@@ -109,6 +119,8 @@ struct Vertex_data{
     position: [f32; 2],
     #[format(R32G32B32_SFLOAT)]
     color: [f32; 3],
+    #[format(R32G32_SFLOAT)]
+    tex_coord: [f32; 2],
 }
 
 #[cfg(debug_assertions)]
@@ -242,10 +254,15 @@ impl Render_context {
             khr_swapchain: true,
             ..Default::default()
         };
-        let (physical_device, indices) = get_physical_device_and_indices(instance.clone(), surface.clone(), &device_extensions);
+        let device_features = DeviceFeatures{
+            sampler_anisotropy: true,
+            ..Default::default()
+        };
+
+        let (physical_device, indices) = get_physical_device_and_indices(instance.clone(), surface.clone(), &device_extensions, &device_features);
 
         //Device
-        let (device, queues) = get_device_and_queues::<Vec<Arc<Queue>>>(physical_device.clone(), indices.clone(), device_extensions);
+        let (device, queues) = get_device_and_queues::<Vec<Arc<Queue>>>(physical_device.clone(), indices.clone(), device_extensions, device_features);
 
         //Queues
         let graphics_queue = queues.iter().find(|q| q.queue_family_index() == indices.graphics_family.unwrap()).unwrap().clone();
@@ -255,7 +272,13 @@ impl Render_context {
         let (swap_chain, swap_chain_images) = get_swap_chain_and_images(physical_device.clone(), indices.clone(), device.clone(), surface.clone(), window.clone());
 
         //Graphics pipeline
-        let (graphics_pipeline, render_pass) = get_graphics_pipeline_and_render_pass(device.clone(), swap_chain.clone());
+        let mut bindings = BTreeMap::new();
+        bindings.insert(0, DescriptorSetLayoutBinding{
+            stages: ShaderStages::FRAGMENT,
+            ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::CombinedImageSampler)
+        });
+
+        let (graphics_pipeline, render_pass) = get_graphics_pipeline_and_render_pass(device.clone(), swap_chain.clone(), bindings);
 
         //Image views and frame buffers
         let (swap_chain_image_views, frame_buffers) = get_image_views_and_frame_buffers(swap_chain.clone(), &swap_chain_images, render_pass.clone());
@@ -263,6 +286,7 @@ impl Render_context {
         //Allocators
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(device.clone(), StandardCommandBufferAllocatorCreateInfo::default()));
+        let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(device.clone(), StandardDescriptorSetAllocatorCreateInfo::default()));
 
         //Buffers
         let vertex_buffer = Buffer::from_iter(memory_allocator.clone(), BufferCreateInfo{
@@ -279,10 +303,28 @@ impl Render_context {
             memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
             ..Default::default()
         }, INDICES).expect("Failed to create index buffer");
-        let command_buffers:Vec<_> = frame_buffers.iter().map(|frame_buffer| get_command_buffer(command_buffer_allocator.clone(), CommandBufferUsage::MultipleSubmit, &indices, frame_buffer.clone(), graphics_pipeline.clone(), vertex_buffer.clone(), index_buffer.clone())).collect();
+
+        //Texture
+        let texture_image = get_texture_image("assets/textures/texture.jpg".to_string(), memory_allocator.clone(), command_buffer_allocator.clone(), graphics_queue.clone());
+        let texture_image_view = ImageView::new_default(texture_image.clone()).expect("Failed to create texture image view");
+
+        //Sampler
+        let sampler = get_sampler(physical_device.clone(), device.clone());
+
+        //Descriptor
+        let descriptor_set = get_descriptor_set(descriptor_set_allocator.clone(), graphics_pipeline.layout().set_layouts()[0].clone(), texture_image_view.clone(), sampler.clone());
+
+        //Command buffer
+        let command_buffers:Vec<_> = frame_buffers.iter().map(|frame_buffer|
+            get_draw_command_buffer(command_buffer_allocator.clone(), graphics_queue.queue_family_index(), CommandBufferUsage::MultipleSubmit, frame_buffer.clone(), graphics_pipeline.clone(), vertex_buffer.clone(), index_buffer.clone(), descriptor_set.clone())
+        ).collect();
 
         Render_context{
-            physical_device, indices, device, graphics_queue, present_queue, surface, swap_chain, swap_chain_images, swap_chain_image_views, frame_buffers, graphics_pipeline, render_pass, memory_allocator, command_buffer_allocator, vertex_buffer, index_buffer, command_buffers,
+            physical_device, device, graphics_queue, present_queue, surface,
+            swap_chain, swap_chain_images, swap_chain_image_views, frame_buffers,
+            graphics_pipeline, render_pass, memory_allocator, command_buffer_allocator,
+            descriptor_set_allocator, vertex_buffer, index_buffer, command_buffers,
+            descriptor_set, texture_image, texture_image_view, sampler,
             fences: vec![None; MAX_FRAMES_IN_FLIGHT],
             current_frame: 0,
             refresh_swap_chain: false,
@@ -303,7 +345,9 @@ impl Render_context {
 
         let (image_views, frame_buffers) = get_image_views_and_frame_buffers(swap_chain.clone(), &self.swap_chain_images, self.render_pass.clone());
         self.swap_chain_image_views = image_views;
-        self.command_buffers = frame_buffers.iter().map(|frame_buffer| get_command_buffer(self.command_buffer_allocator.clone(), CommandBufferUsage::MultipleSubmit, &self.indices, frame_buffer.clone(), self.graphics_pipeline.clone(), self.vertex_buffer.clone(), self.index_buffer.clone())).collect();
+        self.command_buffers = frame_buffers.iter().map(|frame_buffer|
+            get_draw_command_buffer(self.command_buffer_allocator.clone(), self.graphics_queue.queue_family_index(), CommandBufferUsage::MultipleSubmit, frame_buffer.clone(), self.graphics_pipeline.clone(), self.vertex_buffer.clone(), self.index_buffer.clone(), self.descriptor_set.clone())
+        ).collect();
         self.frame_buffers = frame_buffers;
     }
 
@@ -446,10 +490,10 @@ fn debug_callback(message_severity:DebugUtilsMessageSeverity, message_type:Debug
     }
 }
 
-fn get_physical_device_and_indices(instance: Arc<Instance>, surface: Arc<Surface>, device_extensions: &DeviceExtensions) -> (Arc<PhysicalDevice>, Queue_family_indices){
+fn get_physical_device_and_indices(instance: Arc<Instance>, surface: Arc<Surface>, device_extensions: &DeviceExtensions, device_features: &DeviceFeatures) -> (Arc<PhysicalDevice>, Queue_family_indices){
     let device_pack = instance.enumerate_physical_devices().expect("Couldn't find physical devices")
         .filter(|physical_device|
-            physical_device.supported_extensions().contains(device_extensions)
+            physical_device.supported_extensions().contains(device_extensions) && physical_device.supported_features().contains(device_features)
             && !physical_device.surface_formats(&surface, Default::default()).unwrap().is_empty()
             && !physical_device.surface_present_modes(&surface, Default::default()).unwrap().is_empty()
         )
@@ -478,7 +522,7 @@ fn get_physical_device_and_indices(instance: Arc<Instance>, surface: Arc<Surface
     device_pack
 }
 
-fn get_device_and_queues<T>(physical_device: Arc<PhysicalDevice>, indices: Queue_family_indices, enabled_extensions: DeviceExtensions) -> (Arc<Device>, T)
+fn get_device_and_queues<T>(physical_device: Arc<PhysicalDevice>, indices: Queue_family_indices, enabled_extensions: DeviceExtensions, enabled_features: DeviceFeatures) -> (Arc<Device>, T)
 where T: FromIterator<Arc<Queue>>
 {
     let (device, queues) = Device::new(
@@ -492,6 +536,7 @@ where T: FromIterator<Arc<Queue>>
                 }
             }).collect(),
             enabled_extensions,
+            enabled_features,
             ..Default::default()
         }
     ).expect("Couldn't create a device");
@@ -524,7 +569,7 @@ fn get_swap_chain_and_images(physical_device: Arc<PhysicalDevice>, indices: Queu
         extent
     }
     else{
-        let [width, height]:[u32;2] = window.inner_size().into();
+        let [width, height]:[u32; 2] = window.inner_size().into();
         let [min_width, min_height] = surface_capabilities.min_image_extent;
         let [max_width, max_height] = surface_capabilities.max_image_extent;
         [width.clamp(min_width, max_width), height.clamp(min_height, max_height)]
@@ -582,7 +627,7 @@ fn get_shader(file_path: String, device: Arc<Device>) -> Arc<ShaderModule>{
             .expect("Failed to create shader module")
     }
 }
-fn get_graphics_pipeline_and_render_pass(device: Arc<Device>, swap_chain: Arc<Swapchain>) -> (Arc<GraphicsPipeline>, Arc<RenderPass>) {
+fn get_graphics_pipeline_and_render_pass(device: Arc<Device>, swap_chain: Arc<Swapchain>, bindings: BTreeMap<u32, DescriptorSetLayoutBinding>) -> (Arc<GraphicsPipeline>, Arc<RenderPass>) {
     //Render pass
     let render_pass = RenderPass::new(device.clone(), RenderPassCreateInfo{
         attachments: vec![AttachmentDescription{
@@ -614,8 +659,8 @@ fn get_graphics_pipeline_and_render_pass(device: Arc<Device>, swap_chain: Arc<Sw
     }).expect("Failed to create render pass");
 
     //Shaders
-    let vertex_shader = get_shader("shaders/vert.spv".to_string(), device.clone());
-    let fragment_shader = get_shader("shaders/frag.spv".to_string(), device.clone());
+    let vertex_shader = get_shader(VERTEX_SHADER_PATH.to_string(), device.clone());
+    let fragment_shader = get_shader(FRAGMENT_SHADER_PATH.to_string(), device.clone());
 
     let vertex_entry = vertex_shader.entry_point("main").unwrap();
     let fragment_entry = fragment_shader.entry_point("main").unwrap();
@@ -627,8 +672,13 @@ fn get_graphics_pipeline_and_render_pass(device: Arc<Device>, swap_chain: Arc<Sw
     ].into_iter().map(|shader_entry| PipelineShaderStageCreateInfo::new(shader_entry)).collect();
 
     //Layout
-    let layout = PipelineLayout::new(device.clone(), PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-        .into_pipeline_layout_create_info(device.clone()).unwrap()).unwrap();
+    let layout = PipelineLayout::new(device.clone(), PipelineLayoutCreateInfo{
+        set_layouts: vec![DescriptorSetLayout::new(device.clone(), DescriptorSetLayoutCreateInfo{
+            bindings,
+            ..Default::default()
+        }).unwrap()],
+        ..Default::default()
+    }).unwrap();
 
     //Pipeline
     (GraphicsPipeline::new(
@@ -660,9 +710,9 @@ fn get_graphics_pipeline_and_render_pass(device: Arc<Device>, swap_chain: Arc<Sw
     ).expect("Failed to create graphics pipeline"), render_pass)
 }
 
-fn get_command_buffer(allocator: Arc<dyn CommandBufferAllocator>, usage: CommandBufferUsage, indices: &Queue_family_indices, frame_buffer: Arc<Framebuffer>, graphics_pipeline: Arc<GraphicsPipeline>, vertex_buffer: impl VertexBuffersCollection, index_buffer: impl Into<IndexBuffer>) -> Arc<PrimaryAutoCommandBuffer> {
+fn get_draw_command_buffer(allocator: Arc<dyn CommandBufferAllocator>, queue_family_index: u32, usage: CommandBufferUsage, frame_buffer: Arc<Framebuffer>, graphics_pipeline: Arc<GraphicsPipeline>, vertex_buffer: impl VertexBuffersCollection, index_buffer: impl Into<IndexBuffer>, descriptor_set: Arc<DescriptorSet>) -> Arc<PrimaryAutoCommandBuffer> {
     let mut builder = AutoCommandBufferBuilder::primary(
-        allocator.clone(), indices.graphics_family.unwrap(), usage).unwrap();
+        allocator.clone(), queue_family_index, usage).unwrap();
 
     //Command record
     unsafe {
@@ -686,9 +736,71 @@ fn get_command_buffer(allocator: Arc<dyn CommandBufferAllocator>, usage: Command
             }].into_iter().collect()).unwrap()
             .bind_vertex_buffers(0, vertex_buffer).unwrap()
             .bind_index_buffer(index_buffer).unwrap()
+            .bind_descriptor_sets(PipelineBindPoint::Graphics, graphics_pipeline.layout().clone(),0, descriptor_set).unwrap()
             .draw_indexed(INDICES.len() as u32,1,0,0, 0).unwrap()
             .end_render_pass(SubpassEndInfo::default()).unwrap();
     }
 
     builder.build().unwrap()
+}
+
+fn get_descriptor_set(allocator: Arc<dyn DescriptorSetAllocator>, layout: Arc<DescriptorSetLayout>, image_view: Arc<ImageView>, sampler: Arc<Sampler>) -> Arc<DescriptorSet> {
+    //Bindings
+    let mut bindings = BTreeMap::new();
+    bindings.insert(0, DescriptorSetLayoutBinding{
+        stages: ShaderStages::FRAGMENT,
+        ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::CombinedImageSampler)
+    });
+
+    DescriptorSet::new(allocator, layout,
+        [
+            WriteDescriptorSet::image_view_with_layout_sampler(0, DescriptorImageViewInfo{
+                image_layout: ImageLayout::ShaderReadOnlyOptimal,
+                image_view
+            }, sampler),
+        ],
+        []
+    ).expect("Failed to create descriptor set")
+}
+
+fn get_image(allocator: Arc<dyn MemoryAllocator>, extent: (u32, u32), format: Format, tiling: ImageTiling, usage: ImageUsage) -> Arc<Image>{
+    Image::new(allocator, ImageCreateInfo{
+        format, tiling, usage,
+        extent: [extent.0, extent.1, 1],
+        sharing: Sharing::Exclusive,
+        ..Default::default()
+    }, AllocationCreateInfo::default()).expect("Failed to create image")
+}
+
+fn get_texture_image(path: String, memory_allocator: Arc<dyn MemoryAllocator>, command_buffer_allocator: Arc<dyn CommandBufferAllocator>, graphics_queue: Arc<Queue>) -> Arc<Image>{
+    let raw_image = ImageReader::open(path).expect("Failed to open the image").decode().expect("Failed to decode the image").into_rgba8();
+
+    let image = get_image(memory_allocator.clone(), raw_image.dimensions(), Format::R8G8B8A8_SRGB, ImageTiling::Optimal, ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED);
+    let image_buffer = Buffer::from_iter(memory_allocator.clone(), BufferCreateInfo{
+        usage: BufferUsage::TRANSFER_SRC,
+        ..Default::default()
+    }, AllocationCreateInfo{
+        memory_type_filter: MemoryTypeFilter::PREFER_HOST | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+        ..Default::default()
+    }, raw_image.into_raw()).unwrap();
+
+    let mut upload_builder = AutoCommandBufferBuilder::primary(command_buffer_allocator, graphics_queue.queue_family_index(), CommandBufferUsage::OneTimeSubmit).unwrap();
+
+    upload_builder.copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(image_buffer, image.clone())).unwrap();
+
+    let _ = upload_builder.build().unwrap().execute(graphics_queue.clone()).unwrap();
+
+    image
+}
+
+fn get_sampler(physical_device: Arc<PhysicalDevice>, device: Arc<Device>) -> Arc<Sampler>{
+    Sampler::new(device.clone(), SamplerCreateInfo{
+        mag_filter: Filter::Linear,
+        min_filter: Filter::Linear,
+        address_mode: [SamplerAddressMode::Repeat; 3],
+        anisotropy: Some(physical_device.properties().max_sampler_anisotropy),
+        border_color: BorderColor::IntOpaqueBlack,
+        mipmap_mode: SamplerMipmapMode::Linear,
+        ..Default::default()
+    }).expect("Failed to create sampler")
 }
