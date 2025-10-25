@@ -8,6 +8,8 @@ build = "build.rs"
 vulkano = "0.35.2"
 winit = "0.30.12"
 image = "0.25.8"
+ffmpeg-next = { version = "8.0.0", features = ["default"] }
+rodio = "0.21.1"
 
 [profile.dev]
 opt-level = 1

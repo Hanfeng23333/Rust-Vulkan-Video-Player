@@ -3,10 +3,15 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::Read;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::time::Instant;
-use image::ImageReader;
+use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, IndexBuffer, Subbuffer};
 use vulkano::command_buffer::allocator::{CommandBufferAllocator, StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferExecFuture, CommandBufferUsage, CopyBufferToImageInfo, PrimaryAutoCommandBuffer, PrimaryCommandBufferAbstract, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo};
+use vulkano::descriptor_set::allocator::{DescriptorSetAllocator, StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo};
+use vulkano::descriptor_set::layout::{DescriptorSetLayout, DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo, DescriptorType};
+use vulkano::descriptor_set::{DescriptorImageViewInfo, DescriptorSet, WriteDescriptorSet};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags};
 use vulkano::format::Format;
@@ -23,18 +28,14 @@ use vulkano::pipeline::graphics::rasterization::{CullMode, FrontFace, Rasterizat
 use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexBuffersCollection, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::{Scissor, Viewport, ViewportState};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
-use vulkano::pipeline::layout::{PipelineDescriptorSetLayoutCreateInfo, PipelineLayoutCreateInfo};
+use vulkano::pipeline::layout::PipelineLayoutCreateInfo;
 use vulkano::pipeline::{DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, Framebuffer, FramebufferCreateInfo, RenderPass, RenderPassCreateInfo, Subpass, SubpassDependency, SubpassDescription};
 use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo, ShaderStages};
 use vulkano::swapchain::{acquire_next_image, ColorSpace, PresentFuture, PresentMode, Surface, Swapchain, SwapchainAcquireFuture, SwapchainCreateInfo, SwapchainPresentInfo};
 use vulkano::sync::future::{FenceSignalFuture, JoinFuture};
-use vulkano::sync::{AccessFlags, GpuFuture, PipelineStages, Sharing};
+use vulkano::sync::{AccessFlags, GpuFuture, ImageMemoryBarrier, PipelineStages, Sharing};
 use vulkano::{shader, sync, Validated, Version, VulkanError, VulkanLibrary};
-use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, IndexBuffer, Subbuffer};
-use vulkano::descriptor_set::allocator::{DescriptorSetAllocator, StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo};
-use vulkano::descriptor_set::{DescriptorImageViewInfo, DescriptorSet, WriteDescriptorSet};
-use vulkano::descriptor_set::layout::{DescriptorBindingFlags, DescriptorSetLayout, DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo, DescriptorType};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
@@ -64,11 +65,13 @@ pub struct Vulkan_application{
     event_loop: Option<EventLoop<()>>,
     window_attributes: WindowAttributes,
     window: Option<Arc<Window>>,
+    pub states: Arc<States>,
     
     //Vulkan attributes
     instance: Arc<Instance>,
     _debug_messenger: Option<DebugUtilsMessenger>,
     render_context: Option<Render_context>,
+    frame_receiver: Receiver<Image_data>,
 }
 
 #[derive(Default, Clone)]
@@ -95,8 +98,6 @@ struct Render_context{
     vertex_buffer: Subbuffer<[Vertex_data]>,
     index_buffer: Subbuffer<[u16]>,
     descriptor_set: Arc<DescriptorSet>,
-    texture_image: Arc<Image>,
-    texture_image_view: Arc<ImageView>,
     sampler: Arc<Sampler>,
 
     //Allocators
@@ -129,9 +130,22 @@ struct FPS_counter{
     previous_time: Instant,
 }
 
+//Functional structs
+#[derive(Default)]
+pub struct States{
+    pub start_video: AtomicBool,
+    pub start_render: AtomicBool,
+}
+
+pub struct Image_data{
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+}
+
 //Impls
 impl Vulkan_application{
-    pub fn new(title: String, size:(f64, f64)) -> Vulkan_application{
+    pub fn new(title: String, size:(f64, f64), frame_receiver: Receiver<Image_data>) -> Vulkan_application{
         //Window attributes
         let event_loop = Some(EventLoop::new().expect("Failed to create event loop"));
 
@@ -155,9 +169,10 @@ impl Vulkan_application{
             window_attributes: WindowAttributes::default()
                 .with_title(title)
                 .with_inner_size(LogicalSize::new(size.0, size.1)),
+            states: States::new(),
 
             //Vulkan
-            instance, _debug_messenger,
+            instance, _debug_messenger, frame_receiver,
             render_context: None,
         }
     }
@@ -176,6 +191,9 @@ impl ApplicationHandler for Vulkan_application{
             self.render_context = Some(Render_context::new(self.instance.clone(), window.clone()));
             self.render_context.as_mut().unwrap().fps_counter.reset();
         }
+
+        self.states.start_video.store(true, Ordering::Relaxed);
+        while !self.states.start_render.load(Ordering::Relaxed) {}
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
@@ -190,12 +208,15 @@ impl ApplicationHandler for Vulkan_application{
                 let render_context = self.render_context.as_mut().unwrap();
                 let window = self.window.as_ref().unwrap();
 
-                render_context.draw_frame(window.clone());
+                if let Ok(image_data) = self.frame_receiver.try_recv(){
+                    render_context.push_frame(image_data);
+                    render_context.draw_frame(window.clone());
 
-                #[cfg(debug_assertions)]
-                {
-                    if let Some(fps) = render_context.fps_counter.update(FPS_COUNT_INTERVAL){
-                        println!("FPS: {}", fps);
+                    #[cfg(debug_assertions)]
+                    {
+                        if let Some(fps) = render_context.fps_counter.update(FPS_COUNT_INTERVAL){
+                            println!("FPS: {}", fps);
+                        }
                     }
                 }
 
@@ -304,15 +325,12 @@ impl Render_context {
             ..Default::default()
         }, INDICES).expect("Failed to create index buffer");
 
-        //Texture
-        let texture_image = get_texture_image("assets/textures/texture.jpg".to_string(), memory_allocator.clone(), command_buffer_allocator.clone(), graphics_queue.clone());
-        let texture_image_view = ImageView::new_default(texture_image.clone()).expect("Failed to create texture image view");
-
         //Sampler
         let sampler = get_sampler(physical_device.clone(), device.clone());
 
         //Descriptor
-        let descriptor_set = get_descriptor_set(descriptor_set_allocator.clone(), graphics_pipeline.layout().set_layouts()[0].clone(), texture_image_view.clone(), sampler.clone());
+        let default_image_view = ImageView::new_default(get_texture_image(Image_data{width: 1, height: 1, data: vec![0,0,0,0]}, memory_allocator.clone(), command_buffer_allocator.clone(), graphics_queue.clone())).unwrap();
+        let descriptor_set = get_descriptor_set(descriptor_set_allocator.clone(), graphics_pipeline.layout().set_layouts()[0].clone(), default_image_view, sampler.clone());
 
         //Command buffer
         let command_buffers:Vec<_> = frame_buffers.iter().map(|frame_buffer|
@@ -324,11 +342,11 @@ impl Render_context {
             swap_chain, swap_chain_images, swap_chain_image_views, frame_buffers,
             graphics_pipeline, render_pass, memory_allocator, command_buffer_allocator,
             descriptor_set_allocator, vertex_buffer, index_buffer, command_buffers,
-            descriptor_set, texture_image, texture_image_view, sampler,
+            descriptor_set, sampler,
             fences: vec![None; MAX_FRAMES_IN_FLIGHT],
             current_frame: 0,
             refresh_swap_chain: false,
-            fps_counter: FPS_counter::new()
+            fps_counter: FPS_counter::new(),
         }
     }
 
@@ -345,10 +363,8 @@ impl Render_context {
 
         let (image_views, frame_buffers) = get_image_views_and_frame_buffers(swap_chain.clone(), &self.swap_chain_images, self.render_pass.clone());
         self.swap_chain_image_views = image_views;
-        self.command_buffers = frame_buffers.iter().map(|frame_buffer|
-            get_draw_command_buffer(self.command_buffer_allocator.clone(), self.graphics_queue.queue_family_index(), CommandBufferUsage::MultipleSubmit, frame_buffer.clone(), self.graphics_pipeline.clone(), self.vertex_buffer.clone(), self.index_buffer.clone(), self.descriptor_set.clone())
-        ).collect();
         self.frame_buffers = frame_buffers;
+        self.refresh_command_buffers();
     }
 
     fn draw_frame(&mut self, window: Arc<Window>) {
@@ -401,6 +417,27 @@ impl Render_context {
 
         self.current_frame = (self.current_frame+1)%MAX_FRAMES_IN_FLIGHT;
     }
+
+    pub fn push_frame(&mut self, image_data: Image_data){
+        let image = get_texture_image(image_data, self.memory_allocator.clone(), self.command_buffer_allocator.clone(), self.graphics_queue.clone());
+        let image_view = ImageView::new_default(image.clone()).unwrap();
+
+        unsafe{
+            self.device.wait_idle().unwrap();
+            self.descriptor_set.update_by_ref([WriteDescriptorSet::image_view_with_layout_sampler(0, DescriptorImageViewInfo {
+                image_layout: ImageLayout::ShaderReadOnlyOptimal,
+                image_view: image_view.clone(),
+            }, self.sampler.clone()), ], []).unwrap()
+        }
+
+        self.refresh_command_buffers();
+    }
+
+    fn refresh_command_buffers(&mut self){
+        self.command_buffers = self.frame_buffers.iter().map(|frame_buffer|
+            get_draw_command_buffer(self.command_buffer_allocator.clone(), self.graphics_queue.queue_family_index(), CommandBufferUsage::MultipleSubmit, frame_buffer.clone(), self.graphics_pipeline.clone(), self.vertex_buffer.clone(), self.index_buffer.clone(), self.descriptor_set.clone())
+        ).collect();
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -424,6 +461,12 @@ impl FPS_counter {
         else {
             None
         }
+    }
+}
+
+impl States {
+    fn new() -> Arc<States>{
+        Arc::new(States::default())
     }
 }
 
@@ -752,15 +795,12 @@ fn get_descriptor_set(allocator: Arc<dyn DescriptorSetAllocator>, layout: Arc<De
         ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::CombinedImageSampler)
     });
 
-    DescriptorSet::new(allocator, layout,
-        [
-            WriteDescriptorSet::image_view_with_layout_sampler(0, DescriptorImageViewInfo{
-                image_layout: ImageLayout::ShaderReadOnlyOptimal,
-                image_view
-            }, sampler),
-        ],
-        []
-    ).expect("Failed to create descriptor set")
+    DescriptorSet::new(allocator, layout, [
+        WriteDescriptorSet::image_view_with_layout_sampler(0, DescriptorImageViewInfo{
+            image_layout: ImageLayout::ShaderReadOnlyOptimal,
+            image_view
+        }, sampler)
+    ], []).expect("Failed to create descriptor set")
 }
 
 fn get_image(allocator: Arc<dyn MemoryAllocator>, extent: (u32, u32), format: Format, tiling: ImageTiling, usage: ImageUsage) -> Arc<Image>{
@@ -772,17 +812,15 @@ fn get_image(allocator: Arc<dyn MemoryAllocator>, extent: (u32, u32), format: Fo
     }, AllocationCreateInfo::default()).expect("Failed to create image")
 }
 
-fn get_texture_image(path: String, memory_allocator: Arc<dyn MemoryAllocator>, command_buffer_allocator: Arc<dyn CommandBufferAllocator>, graphics_queue: Arc<Queue>) -> Arc<Image>{
-    let raw_image = ImageReader::open(path).expect("Failed to open the image").decode().expect("Failed to decode the image").into_rgba8();
-
-    let image = get_image(memory_allocator.clone(), raw_image.dimensions(), Format::R8G8B8A8_SRGB, ImageTiling::Optimal, ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED);
+fn get_texture_image(image_data: Image_data, memory_allocator: Arc<dyn MemoryAllocator>, command_buffer_allocator: Arc<dyn CommandBufferAllocator>, graphics_queue: Arc<Queue>) -> Arc<Image>{
+    let image = get_image(memory_allocator.clone(), (image_data.width, image_data.height), Format::R8G8B8A8_SRGB, ImageTiling::Optimal, ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED);
     let image_buffer = Buffer::from_iter(memory_allocator.clone(), BufferCreateInfo{
         usage: BufferUsage::TRANSFER_SRC,
         ..Default::default()
     }, AllocationCreateInfo{
         memory_type_filter: MemoryTypeFilter::PREFER_HOST | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
         ..Default::default()
-    }, raw_image.into_raw()).unwrap();
+    }, image_data.data).unwrap();
 
     let mut upload_builder = AutoCommandBufferBuilder::primary(command_buffer_allocator, graphics_queue.queue_family_index(), CommandBufferUsage::OneTimeSubmit).unwrap();
 
