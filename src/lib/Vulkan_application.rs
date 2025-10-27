@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
+use ffmpeg_next::frame::Video;
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, IndexBuffer, Subbuffer};
 use vulkano::command_buffer::allocator::{CommandBufferAllocator, StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferExecFuture, CommandBufferUsage, CopyBufferToImageInfo, PrimaryAutoCommandBuffer, PrimaryCommandBufferAbstract, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo};
@@ -41,6 +42,7 @@ use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowAttributes, WindowId};
+use crate::lib::Media_handler::States;
 
 //Consts
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
@@ -131,12 +133,6 @@ struct FPS_counter{
 }
 
 //Functional structs
-#[derive(Default)]
-pub struct States{
-    pub start_video: AtomicBool,
-    pub start_render: AtomicBool,
-}
-
 pub struct Image_data{
     pub width: u32,
     pub height: u32,
@@ -145,7 +141,7 @@ pub struct Image_data{
 
 //Impls
 impl Vulkan_application{
-    pub fn new(title: String, size:(f64, f64), frame_receiver: Receiver<Image_data>) -> Vulkan_application{
+    pub fn new(title: String, size:(f64, f64), frame_receiver: Receiver<Image_data>, states: Arc<States>) -> Vulkan_application{
         //Window attributes
         let event_loop = Some(EventLoop::new().expect("Failed to create event loop"));
 
@@ -164,12 +160,11 @@ impl Vulkan_application{
         
         Vulkan_application{
             //Window
-            event_loop,
+            event_loop, states,
             window: None,
             window_attributes: WindowAttributes::default()
                 .with_title(title)
                 .with_inner_size(LogicalSize::new(size.0, size.1)),
-            states: States::new(),
 
             //Vulkan
             instance, _debug_messenger, frame_receiver,
@@ -192,8 +187,8 @@ impl ApplicationHandler for Vulkan_application{
             self.render_context.as_mut().unwrap().fps_counter.reset();
         }
 
-        self.states.start_video.store(true, Ordering::Relaxed);
-        while !self.states.start_render.load(Ordering::Relaxed) {}
+        self.states.start_decode.store(true, Ordering::Relaxed);
+        while !self.states.start_video.load(Ordering::Relaxed) {}
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
@@ -464,9 +459,11 @@ impl FPS_counter {
     }
 }
 
-impl States {
-    fn new() -> Arc<States>{
-        Arc::new(States::default())
+impl Image_data{
+    pub fn new(frame: &Video) -> Image_data{
+        Image_data{
+            width: frame.width(), height: frame.height(), data: frame.data(0).to_vec()
+        }
     }
 }
 
