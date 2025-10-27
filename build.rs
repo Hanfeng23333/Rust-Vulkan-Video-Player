@@ -2,6 +2,9 @@ use std::{env, fs};
 use std::path::Path;
 
 fn main() {
+    println!("cargo:rustc-link-lib=strmiids");
+    println!("cargo:rustc-link-lib=mfuuid");
+
     let root_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let profile = env::var("PROFILE").unwrap();
 
