@@ -71,7 +71,7 @@ pub struct Vulkan_application{
     
     //Vulkan attributes
     instance: Arc<Instance>,
-    _debug_messenger: Option<DebugUtilsMessenger>,
+    #[cfg(debug_assertions)] _debug_messenger: DebugUtilsMessenger,
     render_context: Option<Render_context>,
     frame_receiver: Receiver<Image_data>,
 }
@@ -147,16 +147,13 @@ impl Vulkan_application{
 
         //Vulkan attributes
         let instance = get_vulkan_instance(event_loop.as_ref().unwrap());
-        let _debug_messenger = if cfg!(debug_assertions){
-            Some(DebugUtilsMessenger::new(instance.clone(), DebugUtilsMessengerCreateInfo{
-                message_severity: DebugUtilsMessageSeverity::ERROR | DebugUtilsMessageSeverity::WARNING | DebugUtilsMessageSeverity::VERBOSE,
-                message_type: DebugUtilsMessageType::GENERAL | DebugUtilsMessageType::PERFORMANCE | DebugUtilsMessageType::VALIDATION,
-                ..DebugUtilsMessengerCreateInfo::user_callback(unsafe { DebugUtilsMessengerCallback::new(debug_callback) })
-            }).unwrap())
-        }
-        else{
-            None
-        };
+
+        #[cfg(debug_assertions)]
+        let _debug_messenger = DebugUtilsMessenger::new(instance.clone(), DebugUtilsMessengerCreateInfo{
+            message_severity: DebugUtilsMessageSeverity::ERROR | DebugUtilsMessageSeverity::WARNING | DebugUtilsMessageSeverity::VERBOSE,
+            message_type: DebugUtilsMessageType::GENERAL | DebugUtilsMessageType::PERFORMANCE | DebugUtilsMessageType::VALIDATION,
+            ..DebugUtilsMessengerCreateInfo::user_callback(unsafe { DebugUtilsMessengerCallback::new(debug_callback) })
+        }).unwrap();
         
         Vulkan_application{
             //Window
@@ -167,7 +164,8 @@ impl Vulkan_application{
                 .with_inner_size(LogicalSize::new(size.0, size.1)),
 
             //Vulkan
-            instance, _debug_messenger, frame_receiver,
+            instance, frame_receiver,
+            #[cfg(debug_assertions)] _debug_messenger,
             render_context: None,
         }
     }
@@ -184,7 +182,10 @@ impl ApplicationHandler for Vulkan_application{
             let window = Arc::new(event_loop.create_window(self.window_attributes.clone()).expect("Failed to create window"));
             self.window = Some(window.clone());
             self.render_context = Some(Render_context::new(self.instance.clone(), window.clone()));
-            self.render_context.as_mut().unwrap().fps_counter.reset();
+            #[cfg(debug_assertions)]
+            {
+                self.render_context.as_mut().unwrap().fps_counter.reset();
+            }
         }
 
         self.states.start_decode.store(true, Ordering::Relaxed);
@@ -341,7 +342,7 @@ impl Render_context {
             fences: vec![None; MAX_FRAMES_IN_FLIGHT],
             current_frame: 0,
             refresh_swap_chain: false,
-            fps_counter: FPS_counter::new(),
+            #[cfg(debug_assertions)] fps_counter: FPS_counter::new(),
         }
     }
 
